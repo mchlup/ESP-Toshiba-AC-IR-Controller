@@ -17,15 +17,18 @@ Firmware pro ESP8266/ESP32, které umožňuje učit se IR kódy z libovolných o
 - IR LED s tranzistorovým budičem připojená na pin `IR_SEND_PIN` (výchozí GPIO4 / D2).
 - Napájení 3.3 V a společná zem.
 
-## Sestavení
+## Příprava projektu pro Arduino IDE
 
-Projekt používá PlatformIO. Po úpravě souboru `src/main.cpp` s přihlašovacími údaji k Wi-Fi stačí spustit:
+1. Naklonujte repozitář a otevřete soubor `ESPToshibaACIRController.ino` v Arduino IDE. (IDE vás může požádat o přejmenování složky na `ESPToshibaACIRController`.)
+2. V menu **Nástroje → Deska** zvolte odpovídající desku ESP8266 nebo ESP32 a nakonfigurujte správný port.
+3. Do adresáře `sketchbook/libraries` nainstalujte (např. přes Správce knihoven) následující knihovny:
+   - [ArduinoJson](https://arduinojson.org/) verze 6 nebo novější,
+   - [IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266) (automaticky poskytuje `IRrecv`/`IRsend`),
+   - `LittleFS` (ESP8266 používá vestavěnou implementaci, pro ESP32 nainstalujte knihovnu [LittleFS_esp32](https://github.com/lorol/LITTLEFS)).
+4. V souboru `ESPToshibaACIRController.ino` upravte konstanty `WIFI_SSID` a `WIFI_PASSWORD` podle vaší sítě.
+5. Nahrajte firmware standardním tlačítkem **Nahrát**.
 
-```bash
-pio run -t upload
-```
-
-Výchozí nastavení obsahuje prostředí pro ESP8266 (`nodemcuv2`) i ESP32 (`esp32dev`).
+LittleFS se při prvním spuštění automaticky inicializuje; pokud chcete smazat uložené kódy, můžete zavolat `LITTLEFS.format()` v konzoli nebo ručně odstranit soubor `/codes.json`.
 
 ## Webové rozhraní
 
