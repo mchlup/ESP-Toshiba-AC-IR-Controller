@@ -24,7 +24,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>ESP IR kontrolér</h1>
+  <h1 id=\"appTitle\">ESP IR kontrolér</h1>
   <section>
     <h2>Přidat / naučit kód</h2>
     <label for=\"deviceName\">Název zařízení / funkce:</label>
@@ -54,6 +54,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <section>
     <h2>Stav</h2>
     <p id=\"status\">Načítám stav...</p>
+    <p id=\"wifiState\"></p>
   </section>
 
   <script>
@@ -99,6 +100,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       try {
         const status = await fetchJSON('/api/status');
         document.getElementById('status').textContent = status.message;
+        if (status.controllerName) {
+          document.title = `${status.controllerName} – IR ovladač`;
+          document.getElementById('appTitle').textContent = status.controllerName;
+        }
+        const wifiState = document.getElementById('wifiState');
+        if (status.wifiConnected) {
+          wifiState.textContent = `Wi-Fi připojeno (${status.controllerName || 'zařízení'})`;
+        } else {
+          wifiState.textContent = 'Wi-Fi není připojeno';
+        }
         const hint = document.getElementById('learnHint');
         if (status.learning) {
           hint.textContent = 'Zaměřte ovladač na přijímač a stiskněte požadované tlačítko.';
