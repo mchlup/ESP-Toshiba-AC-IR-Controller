@@ -9,7 +9,6 @@ Firmware pro ESP8266/ESP32, které umožňuje učit se IR kódy z libovolných o
 - Odesílání kódů dle názvu zařízení / funkce.
 - Přehled uložených kódů a jejich mazání přes webové UI.
 - REST API pro integraci s dalšími systémy.
-- Správa připojení k Wi-Fi přes portál [WiFiManager](https://github.com/tzapu/WiFiManager) včetně vlastních parametrů zařízení.
 
 ## Hardwarové požadavky
 
@@ -25,16 +24,11 @@ Firmware pro ESP8266/ESP32, které umožňuje učit se IR kódy z libovolných o
 3. Do adresáře `sketchbook/libraries` nainstalujte (např. přes Správce knihoven) následující knihovny:
    - [ArduinoJson](https://arduinojson.org/) verze 6 nebo novější,
    - [IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266) (automaticky poskytuje `IRrecv`/`IRsend`),
-   - [WiFiManager](https://github.com/tzapu/WiFiManager),
    - `LittleFS` (ESP8266 používá vestavěnou implementaci, pro ESP32 nainstalujte knihovnu [LittleFS_esp32](https://github.com/lorol/LITTLEFS)).
-4. Nahrajte firmware standardním tlačítkem **Nahrát**.
+4. V souboru `ESPToshibaACIRController.ino` upravte konstanty `WIFI_SSID` a `WIFI_PASSWORD` podle vaší sítě.
+5. Nahrajte firmware standardním tlačítkem **Nahrát**.
 
-Po nahrání se zařízení přepne do režimu konfigurace Wi-Fi (přístupový bod `ESP-IR-Setup`). Připojte se k němu, otevřete `http://192.168.4.1/` a v portálu WiFiManageru zadejte přístupové údaje k vaší síti. Na stejné stránce najdete také vlastní parametry:
-
-- **Název zařízení** – text použitý v uživatelském rozhraní a odpovědích API.
-- **Doba učení (ms)** – maximální délka čekání na zachycení IR kódu.
-
-Po uložení se zařízení restartuje a připojí k vybrané síti. Konfigurace se ukládá do souboru `/config.json` v LittleFS (kódy zůstávají v `/codes.json`). Pokud chcete vymazat konfiguraci, smažte tyto soubory nebo spusťte `LITTLEFS.format()`.
+LittleFS se při prvním spuštění automaticky inicializuje; pokud chcete smazat uložené kódy, můžete zavolat `LITTLEFS.format()` v konzoli nebo ručně odstranit soubor `/codes.json`.
 
 ## Webové rozhraní
 
@@ -44,7 +38,7 @@ Po připojení k Wi-Fi otevře zařízení webový server na portu 80. Hlavní s
 - zobrazit seznam uložených kódů,
 - poslat nebo smazat vybraný kód.
 
-Status sekce průběžně informuje o stavu připojení, posledním naučeném kódu a využívá nastavený název zařízení.
+Status sekce průběžně informuje o stavu připojení a posledním naučeném kódu.
 
 ## REST API
 
@@ -58,6 +52,6 @@ Status sekce průběžně informuje o stavu připojení, posledním naučeném k
 
 ## Poznámky
 
-- Pokud potřebujete změnit Wi-Fi síť nebo parametry zařízení, odpojte se od známé Wi-Fi (např. vypnutím routeru). Po několika neúspěšných pokusech o připojení WiFiManager automaticky znovu otevře konfigurační portál.
-- Učení se automaticky ukončí po uplynutí nastaveného limitu (výchozí 60 s), pokud není zachycen žádný kód.
+- V nastavení vyplňte SSID a heslo vaší Wi-Fi sítě (`WIFI_SSID`, `WIFI_PASSWORD`).
+- Učení se automaticky ukončí po 60 s, pokud není zachycen žádný kód.
 - Kódy známých protokolů jsou ukládány společně se surovými daty, takže je možné je reprodukovat i pro neznámé protokoly.

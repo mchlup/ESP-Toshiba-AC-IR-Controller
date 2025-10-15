@@ -23,29 +23,24 @@ using WebServerType = WebServer;
 #error "Unsupported platform"
 #endif
 
-#include <WiFiManager.h>
-
 #include "index_html.h"
 
 // ====== Uživatelské nastavení ======
+static constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
+static constexpr char WIFI_PASSWORD[] = "YOUR_WIFI_PASSWORD";
+
 static constexpr uint16_t IR_RECV_PIN = 14;  // D5 na NodeMCU
 static constexpr uint16_t IR_SEND_PIN = 4;   // D2 na NodeMCU (GPIO4)
-static constexpr const char *kStorageFile = "/codes.json";
-static constexpr const char *kConfigFile = "/config.json";
-static constexpr uint32_t kDefaultCarrierFrequency = 38000;
-static constexpr unsigned long kMinimumLearnTimeoutMs = 5000;
 
-struct DeviceConfig {
-  String deviceName = F("ESP IR Controller");
-  unsigned long learnTimeoutMs = 60000;
-};
+static constexpr unsigned long LEARN_TIMEOUT_MS = 60000;
+static constexpr const char *kStorageFile = "/codes.json";
 
 struct StoredCode {
   String name;
   decode_type_t protocol = decode_type_t::UNKNOWN;
   uint64_t value = 0;
   uint16_t bits = 0;
-  uint32_t frequency = kDefaultCarrierFrequency;
+  uint32_t frequency = 38000;
   std::vector<uint16_t> raw;
   unsigned long updated = 0;
 };
@@ -53,9 +48,7 @@ struct StoredCode {
 IRrecv irReceiver(IR_RECV_PIN, 1024, 15, true);
 IRsend irSender(IR_SEND_PIN);
 WebServerType server(80);
-WiFiManager wifiManager;
 
-DeviceConfig deviceConfig;
 std::vector<StoredCode> codes;
 
 bool learningActive = false;
@@ -64,23 +57,6 @@ unsigned long learningStarted = 0;
 String lastCapturedName;
 String lastCapturedSummary;
 unsigned long lastCaptureMillis = 0;
-
-bool fsReady = false;
-bool shouldPersistConfig = false;
-bool wifiWasConnected = false;
-
-char deviceNameBuffer[33] = "";
-char learnTimeoutBuffer[12] = "";
-WiFiManagerParameter deviceNameParam("device_name", "Název zařízení", deviceNameBuffer, sizeof(deviceNameBuffer));
-WiFiManagerParameter learnTimeoutParam("learn_timeout", "Doba učení (ms)", learnTimeoutBuffer, sizeof(learnTimeoutBuffer));
-
-constexpr uint16_t rawTickUsec() {
-#if defined(USECPERTICK)
-  return USECPERTICK;
-#else
-  return 50;
-#endif
-}
 
 // ====== Utility funkce ======
 
@@ -98,66 +74,6 @@ String protocolToString(decode_type_t proto) {
     return F("UNKNOWN");
   }
   return String(typeToString(proto));
-}
-
-void saveDeviceConfig() {
-  if (!fsReady) {
-    return;
-  }
-
-  DynamicJsonDocument doc(512);
-  doc["deviceName"] = deviceConfig.deviceName;
-  doc["learnTimeoutMs"] = deviceConfig.learnTimeoutMs;
-
-  File file = LITTLEFS.open(kConfigFile, "w");
-  if (!file) {
-    Serial.println(F("Nelze otevřít config pro zápis."));
-    return;
-  }
-  if (serializeJson(doc, file) == 0) {
-    Serial.println(F("Chyba při ukládání config.json"));
-  }
-  file.close();
-}
-
-void loadDeviceConfig() {
-  deviceConfig = DeviceConfig();
-
-  if (!fsReady || !LITTLEFS.exists(kConfigFile)) {
-    return;
-  }
-
-  File file = LITTLEFS.open(kConfigFile, "r");
-  if (!file) {
-    Serial.println(F("Nelze otevřít config pro čtení."));
-    return;
-  }
-
-  DynamicJsonDocument doc(512);
-  DeserializationError err = deserializeJson(doc, file);
-  if (err) {
-    Serial.print(F("Chyba při načítání config.json: "));
-    Serial.println(err.c_str());
-    file.close();
-    return;
-  }
-
-  file.close();
-
-  if (doc.containsKey("deviceName")) {
-    deviceConfig.deviceName = doc["deviceName"].as<String>();
-  }
-  if (doc.containsKey("learnTimeoutMs")) {
-    unsigned long value = doc["learnTimeoutMs"].as<unsigned long>();
-    if (value < kMinimumLearnTimeoutMs) {
-      value = kMinimumLearnTimeoutMs;
-    }
-    deviceConfig.learnTimeoutMs = value;
-  }
-  deviceConfig.deviceName.trim();
-  if (!deviceConfig.deviceName.length()) {
-    deviceConfig.deviceName = F("ESP IR Controller");
-  }
 }
 
 void saveCodes() {
@@ -254,12 +170,12 @@ void handleCapturedCode(const decode_results &results) {
   code.protocol = results.decode_type;
   code.value = results.value;
   code.bits = results.bits;
-  code.frequency = kDefaultCarrierFrequency;
+  code.frequency = results.frequency;
   code.raw.clear();
   if (results.rawlen > 1) {
     code.raw.reserve(results.rawlen - 1);
     for (uint16_t i = 1; i < results.rawlen; i++) {
-      code.raw.push_back(results.rawbuf[i] * rawTickUsec());
+      code.raw.push_back(results.rawbuf[i] * USECPERTICK);
     }
   }
   code.updated = millis();
@@ -305,7 +221,7 @@ void sendJsonResponse(const JsonDocument &doc) {
 }
 
 void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
+  server.send_P(200, F("text/html"), INDEX_HTML);
 }
 
 void handleGetCodes() {
@@ -325,9 +241,6 @@ void handleStatus() {
   DynamicJsonDocument doc(512);
   doc["learning"] = learningActive;
   doc["message"] = makeStatusMessage();
-  doc["controllerName"] = deviceConfig.deviceName;
-  doc["learnTimeoutMs"] = deviceConfig.learnTimeoutMs;
-  doc["wifiConnected"] = wifiConnected();
   if (lastCapturedName.length()) {
     doc["lastCaptured"] = lastCapturedName;
     doc["lastCapturedSummary"] = lastCapturedSummary;
@@ -404,48 +317,26 @@ void handleDelete() {
   server.send(404, F("text/plain"), F("Code not found"));
 }
 
-void syncConfigFromParams() {
-  deviceConfig.deviceName = String(deviceNameParam.getValue());
-  unsigned long timeout = strtoul(learnTimeoutParam.getValue(), nullptr, 10);
-  if (timeout < kMinimumLearnTimeoutMs) {
-    timeout = kMinimumLearnTimeoutMs;
-  }
-  deviceConfig.learnTimeoutMs = timeout;
-  deviceConfig.deviceName.trim();
-  if (!deviceConfig.deviceName.length()) {
-    deviceConfig.deviceName = F("ESP IR Controller");
-  }
-  snprintf(deviceNameBuffer, sizeof(deviceNameBuffer), "%s", deviceConfig.deviceName.c_str());
-  snprintf(learnTimeoutBuffer, sizeof(learnTimeoutBuffer), "%lu", deviceConfig.learnTimeoutMs);
-}
-
-void saveConfigIfNeeded() {
-  if (!shouldPersistConfig) {
-    return;
-  }
-  shouldPersistConfig = false;
-  syncConfigFromParams();
-  saveDeviceConfig();
-  Serial.println(F("Konfigurace uložena."));
-}
-
-void handleWiFi() {
-  wifiManager.process();
-
+void maintainWiFi() {
+  static unsigned long lastAttempt = 0;
+  static bool reported = false;
   if (wifiConnected()) {
-    if (!wifiWasConnected) {
-      wifiWasConnected = true;
+    if (!reported) {
       Serial.print(F("Wi-Fi připojeno, IP adresa: "));
       Serial.println(WiFi.localIP());
-      syncConfigFromParams();
-      saveDeviceConfig();
+      reported = true;
     }
-  } else {
-    if (wifiWasConnected) {
-      Serial.println(F("Wi-Fi odpojeno"));
-    }
-    wifiWasConnected = false;
+    return;
   }
+  reported = false;
+  unsigned long now = millis();
+  if (lastAttempt != 0 && now - lastAttempt < 5000) {
+    return;
+  }
+  lastAttempt = now == 0 ? 1 : now;
+  Serial.println(F("Připojování k Wi-Fi..."));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 void setup() {
@@ -454,8 +345,9 @@ void setup() {
   Serial.println();
   Serial.println(F("Startuji ESP IR kontrolér"));
 
-  WiFi.mode(WIFI_STA);
+  maintainWiFi();
 
+  bool fsReady = false;
 #if defined(ESP8266)
   fsReady = LITTLEFS.begin();
 #elif defined(ESP32)
@@ -464,30 +356,7 @@ void setup() {
   if (!fsReady) {
     Serial.println(F("Nelze připojit souborový systém LittleFS"));
   }
-  loadDeviceConfig();
   loadCodes();
-
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.setSaveParamsCallback([]() {
-    shouldPersistConfig = true;
-  });
-
-  snprintf(deviceNameBuffer, sizeof(deviceNameBuffer), "%s", deviceConfig.deviceName.c_str());
-  snprintf(learnTimeoutBuffer, sizeof(learnTimeoutBuffer), "%lu", deviceConfig.learnTimeoutMs);
-  wifiManager.addParameter(&deviceNameParam);
-  wifiManager.addParameter(&learnTimeoutParam);
-
-  if (!wifiManager.autoConnect("ESP-IR-Setup")) {
-    Serial.println(F("Nelze se připojit k Wi-Fi, čekám na konfiguraci."));
-  } else {
-    wifiWasConnected = true;
-    Serial.print(F("Wi-Fi připojeno, IP adresa: "));
-    Serial.println(WiFi.localIP());
-    syncConfigFromParams();
-    saveDeviceConfig();
-  }
-
-  WiFi.setAutoReconnect(true);
 
   irReceiver.enableIRIn();
   irSender.begin();
@@ -503,11 +372,10 @@ void setup() {
 }
 
 void loop() {
-  handleWiFi();
-  saveConfigIfNeeded();
+  maintainWiFi();
   server.handleClient();
 
-  if (learningActive && millis() - learningStarted > deviceConfig.learnTimeoutMs) {
+  if (learningActive && millis() - learningStarted > LEARN_TIMEOUT_MS) {
     Serial.println(F("Učení vypršelo."));
     cancelLearning();
   }
