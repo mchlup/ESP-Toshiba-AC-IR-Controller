@@ -325,6 +325,14 @@ static void setupFS() {
 }
 
 static void setupWiFi() {
+  wm.setAPCallback([](WiFiManager* manager) {
+    Serial.println(F("-- WiFiManager config portal --"));
+    Serial.print(F("  SSID: "));
+    Serial.println(manager->getConfigPortalSSID());
+    Serial.print(F("  IP: "));
+    Serial.println(WiFi.softAPIP());
+    Serial.println(F("  AP security: open (no password)"));
+  });
   wm.setClass("invert");
   wm.addParameter(&p_devName);
   wm.addParameter(&p_learnTimeout);
@@ -332,9 +340,12 @@ static void setupWiFi() {
   wm.setConnectTimeout(30);
   wm.setConfigPortalTimeout(180);
 
-  if (!wm.autoConnect("ESP-IR-Bridge", "esp-ir-bridge")) {
+  Serial.println(F("Connecting via WiFiManager..."));
+  if (!wm.autoConnect("ESP-IR-Bridge")) {
+    Serial.println(F("WiFiManager failed to connect, rebooting."));
     ESP.restart();
   }
+  Serial.println(F("WiFiManager connected."));
   saveSettings();
 }
 
