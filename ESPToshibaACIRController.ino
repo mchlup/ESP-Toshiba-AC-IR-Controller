@@ -1,522 +1,395 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <IRrecv.h>
-#include <IRremoteESP8266.h>
-#include <IRsend.h>
-#include <IRutils.h>
 #include <vector>
 
 #if defined(ESP8266)
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <LittleFS.h>
-using WebServerType = ESP8266WebServer;
-#define LITTLEFS LittleFS
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+  #include <LittleFS.h>
+  using WebServerType = ESP8266WebServer;
+  #define LITTLEFS LittleFS
 #elif defined(ESP32)
-#include <WiFi.h>
-#include <WebServer.h>
-#include <FS.h>
-#include <LittleFS.h>
-using WebServerType = WebServer;
-#define LITTLEFS LittleFS
+  #include <WiFi.h>
+  #include <WebServer.h>
+  #include <FS.h>
+  #include <LittleFS.h>
+  using WebServerType = WebServer;
+  #define LITTLEFS LittleFS
 #else
-#error "Unsupported platform"
+  #error "Unsupported platform (ESP8266 or ESP32 required)."
 #endif
 
 #include <WiFiManager.h>
 
-#include "index_html.h"
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <IRutils.h>
+// ---- IRremoteESP8266 compatibility guards ----
+// Some older/newer library versions change tick constant names.
+// kRawTick is the canonical constant (microseconds per raw tick).
+#ifndef kRawTick
+  #define kRawTick 50U  // Fallback: 50us per raw tick
+#endif
+  // typeToString(), resultToHumanReadableBasic(), ...
 
-// ====== Uživatelské nastavení ======
-static constexpr uint16_t IR_RECV_PIN = 14;  // D5 na NodeMCU
-static constexpr uint16_t IR_SEND_PIN = 4;   // D2 na NodeMCU (GPIO4)
-static constexpr const char *kStorageFile = "/codes.json";
-static constexpr const char *kConfigFile = "/config.json";
-static constexpr uint32_t kDefaultCarrierFrequency = 38000;
-static constexpr unsigned long kMinimumLearnTimeoutMs = 5000;
+#include "index_html.h"  // PROGMEM INDEX_HTML (WebUI)
 
-struct DeviceConfig {
-  String deviceName = F("ESP IR Controller");
-  unsigned long learnTimeoutMs = 60000;
-};
+// ================== HW / nastavení ==================
+static constexpr uint16_t IR_RECV_PIN = 14;  // D5 / GPIO14
+static constexpr uint16_t IR_SEND_PIN = 4;   // D2 / GPIO4
 
+// Výchozí nosná frekvence pro raw send (kHz)
+static constexpr uint16_t IR_DEFAULT_KHZ = 38;
+
+// Soubory v LittleFS
+static const char* CODES_JSON_PATH    = "/codes.json";
+static const char* SETTINGS_JSON_PATH = "/settings.json";
+
+// WiFiManager custom parametry
+WiFiManager wm;
+WiFiManagerParameter p_devName("devname", "Název zařízení", "ESP-IR-Bridge", 32);
+WiFiManagerParameter p_learnTimeout("learntimeout", "Timeout učení (ms)", "60000", 10);
+
+// Webserver
+WebServerType server(80);
+
+// IR
+IRrecv irrecv(IR_RECV_PIN, 1024, 50, true);
+IRsend irsend(IR_SEND_PIN);
+
+// Stav učení
+struct LearnState {
+  bool active = false;
+  String pendingName;
+  String lastCaptured;
+  unsigned long startedMs = 0;
+  unsigned long timeoutMs = 60000;
+} learn;
+
+// Uložený kód
 struct StoredCode {
   String name;
-  decode_type_t protocol = decode_type_t::UNKNOWN;
-  uint64_t value = 0;
+  String protocol;      // "NEC", "SAMSUNG", "UNKNOWN", ...
   uint16_t bits = 0;
-  uint32_t frequency = kDefaultCarrierFrequency;
-  std::vector<uint16_t> raw;
-  unsigned long updated = 0;
+  uint32_t value = 0;
+  uint32_t address = 0;
+  uint32_t command = 0;
+  uint16_t khz = IR_DEFAULT_KHZ;
+  std::vector<uint32_t> raw;       // durace v µs (mark/space)
+  uint64_t updatedEpochMs = 0;     // pro zobrazení v UI
 };
 
-IRrecv irReceiver(IR_RECV_PIN, 1024, 15, true);
-IRsend irSender(IR_SEND_PIN);
-WebServerType server(80);
-WiFiManager wifiManager;
+std::vector<StoredCode> g_codes;
 
-DeviceConfig deviceConfig;
-std::vector<StoredCode> codes;
-
-bool learningActive = false;
-String learningName;
-unsigned long learningStarted = 0;
-String lastCapturedName;
-String lastCapturedSummary;
-unsigned long lastCaptureMillis = 0;
-
-bool fsReady = false;
-bool shouldPersistConfig = false;
-bool wifiWasConnected = false;
-
-char deviceNameBuffer[33] = "";
-char learnTimeoutBuffer[12] = "";
-WiFiManagerParameter deviceNameParam("device_name", "Název zařízení", deviceNameBuffer, sizeof(deviceNameBuffer));
-WiFiManagerParameter learnTimeoutParam("learn_timeout", "Doba učení (ms)", learnTimeoutBuffer, sizeof(learnTimeoutBuffer));
-
-constexpr uint16_t rawTickUsec() {
-#if defined(USECPERTICK)
-  return USECPERTICK;
-#else
-  return 50;
-#endif
-}
-
-// ====== Utility funkce ======
-
-StoredCode *findCode(const String &name) {
-  for (auto &code : codes) {
-    if (code.name.equalsIgnoreCase(name)) {
-      return &code;
-    }
-  }
-  return nullptr;
-}
-
-String protocolToString(decode_type_t proto) {
-  if (proto == decode_type_t::UNKNOWN) {
-    return F("UNKNOWN");
-  }
-  return String(typeToString(proto));
-}
-
-void saveDeviceConfig() {
-  if (!fsReady) {
-    return;
-  }
-
-  DynamicJsonDocument doc(512);
-  doc["deviceName"] = deviceConfig.deviceName;
-  doc["learnTimeoutMs"] = deviceConfig.learnTimeoutMs;
-
-  File file = LITTLEFS.open(kConfigFile, "w");
-  if (!file) {
-    Serial.println(F("Nelze otevřít config pro zápis."));
-    return;
-  }
-  if (serializeJson(doc, file) == 0) {
-    Serial.println(F("Chyba při ukládání config.json"));
-  }
-  file.close();
-}
-
-void loadDeviceConfig() {
-  deviceConfig = DeviceConfig();
-
-  if (!fsReady || !LITTLEFS.exists(kConfigFile)) {
-    return;
-  }
-
-  File file = LITTLEFS.open(kConfigFile, "r");
-  if (!file) {
-    Serial.println(F("Nelze otevřít config pro čtení."));
-    return;
-  }
-
-  DynamicJsonDocument doc(512);
-  DeserializationError err = deserializeJson(doc, file);
-  if (err) {
-    Serial.print(F("Chyba při načítání config.json: "));
-    Serial.println(err.c_str());
-    file.close();
-    return;
-  }
-
-  file.close();
-
-  if (doc.containsKey("deviceName")) {
-    deviceConfig.deviceName = doc["deviceName"].as<String>();
-  }
-  if (doc.containsKey("learnTimeoutMs")) {
-    unsigned long value = doc["learnTimeoutMs"].as<unsigned long>();
-    if (value < kMinimumLearnTimeoutMs) {
-      value = kMinimumLearnTimeoutMs;
-    }
-    deviceConfig.learnTimeoutMs = value;
-  }
-  deviceConfig.deviceName.trim();
-  if (!deviceConfig.deviceName.length()) {
-    deviceConfig.deviceName = F("ESP IR Controller");
-  }
-}
-
-void saveCodes() {
-  DynamicJsonDocument doc(4096 + codes.size() * 512);
+// ===== Pomocné (FS) =====
+static bool saveCodes() {
+  DynamicJsonDocument doc(64 * 1024);
   JsonArray arr = doc.createNestedArray("items");
-  for (const auto &code : codes) {
-    JsonObject obj = arr.createNestedObject();
-    obj["name"] = code.name;
-    obj["protocol"] = static_cast<uint16_t>(code.protocol);
-    obj["value"] = code.value;
-    obj["bits"] = code.bits;
-    obj["frequency"] = code.frequency;
-    obj["updated"] = code.updated;
-    JsonArray raw = obj.createNestedArray("raw");
-    for (uint16_t v : code.raw) {
-      raw.add(v);
-    }
+  for (const auto &c : g_codes) {
+    JsonObject o = arr.createNestedObject();
+    o["name"]    = c.name;
+    o["protocol"]= c.protocol;
+    o["bits"]    = c.bits;
+    o["value"]   = c.value;
+    o["address"] = c.address;
+    o["command"] = c.command;
+    o["khz"]     = c.khz;
+    o["updated"] = c.updatedEpochMs;
+    JsonArray raw = o.createNestedArray("raw");
+    for (auto us : c.raw) raw.add(us);
   }
-
-  File file = LITTLEFS.open(kStorageFile, "w");
-  if (!file) {
-    Serial.println(F("Nelze otevřít soubor k zápisu."));
-    return;
-  }
-  if (serializeJson(doc, file) == 0) {
-    Serial.println(F("Chyba při ukládání JSON."));
-  }
-  file.close();
+  File f = LITTLEFS.open(CODES_JSON_PATH, "w");
+  if (!f) return false;
+  bool ok = (serializeJson(doc, f) > 0);
+  f.close();
+  return ok;
 }
 
-void loadCodes() {
-  codes.clear();
-  if (!LITTLEFS.exists(kStorageFile)) {
-    return;
-  }
-  File file = LITTLEFS.open(kStorageFile, "r");
-  if (!file) {
-    Serial.println(F("Nelze otevřít soubor k čtení."));
-    return;
-  }
+static void loadCodes() {
+  g_codes.clear();
+  if (!LITTLEFS.exists(CODES_JSON_PATH)) return;
+  File f = LITTLEFS.open(CODES_JSON_PATH, "r");
+  if (!f) return;
 
-  DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, file);
-  if (err) {
-    Serial.print(F("Chyba při načtení JSON: "));
-    Serial.println(err.c_str());
-    file.close();
-    return;
-  }
-  file.close();
+  DynamicJsonDocument doc(64 * 1024);
+  DeserializationError e = deserializeJson(doc, f);
+  f.close();
+  if (e) return;
 
   JsonArray arr = doc["items"].as<JsonArray>();
-  for (JsonObject obj : arr) {
-    StoredCode code;
-    code.name = obj["name"].as<String>();
-    code.protocol = static_cast<decode_type_t>(obj["protocol"].as<uint16_t>());
-    code.value = obj["value"].as<uint64_t>();
-    code.bits = obj["bits"].as<uint16_t>();
-    code.frequency = obj["frequency"].as<uint32_t>();
-    code.updated = obj["updated"].as<unsigned long>();
-    JsonArray raw = obj["raw"].as<JsonArray>();
-    code.raw.reserve(raw.size());
-    for (JsonVariant v : raw) {
-      code.raw.push_back(v.as<uint16_t>());
+  if (arr.isNull()) return;
+
+  for (JsonObject o : arr) {
+    StoredCode c;
+    c.name     = o["name"]     | "";
+    c.protocol = o["protocol"] | "UNKNOWN";
+    c.bits     = o["bits"]     | 0;
+    c.value    = o["value"]    | 0;
+    c.address  = o["address"]  | 0;
+    c.command  = o["command"]  | 0;
+    c.khz      = o["khz"]      | IR_DEFAULT_KHZ;
+    c.updatedEpochMs = o["updated"] | 0ULL;
+    if (o.containsKey("raw")) {
+      for (JsonVariant v : o["raw"].as<JsonArray>()) c.raw.push_back((uint32_t)v.as<unsigned long>());
     }
-    codes.push_back(code);
+    if (c.name.length()) g_codes.push_back(std::move(c));
   }
 }
 
-void startLearning(const String &name) {
-  learningActive = true;
-  learningName = name;
-  learningStarted = millis();
-  lastCapturedSummary = "";
-  Serial.print(F("Učení zahájeno pro: "));
-  Serial.println(name);
+static bool saveSettings() {
+  DynamicJsonDocument doc(1024);
+  doc["devname"]         = p_devName.getValue();
+  doc["learn_timeout_ms"]= strtoul(p_learnTimeout.getValue(), nullptr, 10);
+
+  File f = LITTLEFS.open(SETTINGS_JSON_PATH, "w");
+  if (!f) return false;
+  bool ok = (serializeJson(doc, f) > 0);
+  f.close();
+  return ok;
 }
 
-void cancelLearning() {
-  learningActive = false;
-  learningName = "";
-  learningStarted = 0;
+static void loadSettings() {
+  if (!LITTLEFS.exists(SETTINGS_JSON_PATH)) return;
+  File f = LITTLEFS.open(SETTINGS_JSON_PATH, "r");
+  if (!f) return;
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  f.close();
+
+  const char* dn = doc["devname"] | nullptr;
+  if (dn && strlen(dn)) p_devName.setValue(dn, strlen(dn));
+
+  unsigned long lt = doc["learn_timeout_ms"] | 60000UL;
+  char buf[16]; snprintf(buf, sizeof(buf), "%lu", lt);
+  p_learnTimeout.setValue(buf, strlen(buf));
+  learn.timeoutMs = lt;
 }
 
-void handleCapturedCode(const decode_results &results) {
-  StoredCode *existing = findCode(learningName);
-  if (!existing) {
-    codes.push_back(StoredCode());
-    existing = &codes.back();
+// Hledání kódu podle názvu
+static int findCodeIndex(const String& name) {
+  for (size_t i = 0; i < g_codes.size(); ++i)
+    if (g_codes[i].name == name) return (int)i;
+  return -1;
+}
+
+// Převod decode_results -> StoredCode (RAW + metadata)
+static StoredCode resultsToStored(const decode_results& results, const String& name) {
+  StoredCode c;
+  c.name     = name;
+  c.bits     = results.bits;
+  c.value    = results.value;
+  c.address  = results.address;
+  c.command  = results.command;
+  c.protocol = typeToString(results.decode_type);
+  c.khz      = IR_DEFAULT_KHZ; // results frekvenci neobsahují -> použij default
+
+  // rawbuf[] je v tick jednotkách; 1 tick = kRawTick µs
+  for (uint16_t i = 0; i < results.rawlen; i++) {
+    uint32_t usec = (uint32_t)results.rawbuf[i] * kRawTick;
+    c.raw.push_back(usec);
   }
-
-  StoredCode &code = *existing;
-  code.name = learningName;
-  code.protocol = results.decode_type;
-  code.value = results.value;
-  code.bits = results.bits;
-  code.frequency = kDefaultCarrierFrequency;
-  code.raw.clear();
-  if (results.rawlen > 1) {
-    code.raw.reserve(results.rawlen - 1);
-    for (uint16_t i = 1; i < results.rawlen; i++) {
-      code.raw.push_back(results.rawbuf[i] * rawTickUsec());
-    }
-  }
-  code.updated = millis();
-
-  saveCodes();
-  lastCapturedName = learningName;
-  lastCaptureMillis = millis();
-  String summary = protocolToString(results.decode_type);
-  summary += F(" (bits: ");
-  summary += results.bits;
-  summary += F(")");
-  lastCapturedSummary = summary;
-  Serial.print(F("Kód uložen pro "));
-  Serial.println(code.name);
-  cancelLearning();
+  c.updatedEpochMs = millis();
+  return c;
 }
 
-bool wifiConnected() {
-  return WiFi.status() == WL_CONNECTED;
-}
-
-String makeStatusMessage() {
-  if (!wifiConnected()) {
-    return F("Připojování k Wi-Fi...");
-  }
-  if (learningActive) {
-    return F("Probíhá učení IR kódu...");
-  }
-  if (lastCapturedName.length()) {
-    String message = F("Naposledy naučený: ");
-    message += lastCapturedName;
-    message += F(" ");
-    message += lastCapturedSummary;
-    return message;
-  }
-  return F("Připraveno");
-}
-
-void sendJsonResponse(const JsonDocument &doc) {
-  String payload;
-  serializeJson(doc, payload);
-  server.send(200, "application/json", payload);
-}
-
-void handleRoot() {
+// ===== HTTP Handlery =====
+static void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-void handleGetCodes() {
-  DynamicJsonDocument doc(4096 + codes.size() * 256);
-  JsonArray arr = doc.createNestedArray("items");
-  for (const auto &code : codes) {
-    JsonObject obj = arr.createNestedObject();
-    obj["name"] = code.name;
-    obj["protocol"] = protocolToString(code.protocol);
-    obj["bits"] = code.bits;
-    obj["updated"] = code.updated;
-  }
-  sendJsonResponse(doc);
-}
-
-void handleStatus() {
+static void handleStatus() {
   DynamicJsonDocument doc(512);
-  doc["learning"] = learningActive;
-  doc["message"] = makeStatusMessage();
-  doc["controllerName"] = deviceConfig.deviceName;
-  doc["learnTimeoutMs"] = deviceConfig.learnTimeoutMs;
-  doc["wifiConnected"] = wifiConnected();
-  if (lastCapturedName.length()) {
-    doc["lastCaptured"] = lastCapturedName;
-    doc["lastCapturedSummary"] = lastCapturedSummary;
-    doc["lastCapturedAt"] = lastCaptureMillis;
-  }
-  sendJsonResponse(doc);
+  String msg;
+  if (learn.active) msg = "Učení probíhá...";
+  else if (learn.lastCaptured.length()) msg = String("Připraveno. Naposledy: ") + learn.lastCaptured;
+  else msg = "Připraveno.";
+
+  doc["message"]        = msg;
+  doc["learning"]       = learn.active;
+  doc["lastCaptured"]   = learn.lastCaptured;
+  doc["controllerName"] = String(p_devName.getValue());
+  doc["wifiConnected"]  = (WiFi.status() == WL_CONNECTED);
+
+  String out; out.reserve(256);
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-bool parseJsonRequest(DynamicJsonDocument &doc) {
-  if (!server.hasArg("plain")) {
-    server.send(400, "text/plain", "Missing body");
-    return false;
+static void handleCodesList() {
+  DynamicJsonDocument doc(64 * 1024);
+  JsonArray arr = doc.createNestedArray("items");
+  for (const auto& c : g_codes) {
+    JsonObject o = arr.createNestedObject();
+    o["name"]    = c.name;
+    o["protocol"]= c.protocol;
+    o["bits"]    = c.bits;
+    o["updated"] = c.updatedEpochMs;
   }
-  DeserializationError err = deserializeJson(doc, server.arg("plain"));
-  if (err) {
-    server.send(400, "text/plain", String(F("JSON error: ")) + err.c_str());
-    return false;
-  }
-  return true;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-void handleLearn() {
-  DynamicJsonDocument doc(256);
-  if (!parseJsonRequest(doc)) {
-    return;
-  }
-  String name = doc["name"].as<String>();
-  name.trim();
-  if (!name.length()) {
-    server.send(400, "text/plain", "Name is required");
-    return;
-  }
-  startLearning(name);
-  server.send(200, "application/json", "{\"status\":\"learning\"}");
-}
-
-void handleSend() {
-  DynamicJsonDocument doc(256);
-  if (!parseJsonRequest(doc)) {
-    return;
-  }
-  String name = doc["name"].as<String>();
-  StoredCode *code = findCode(name);
-  if (!code) {
-    server.send(404, "text/plain", "Code not found");
-    return;
-  }
-
-  if (code->protocol != decode_type_t::UNKNOWN) {
-    irSender.send(code->protocol, code->value, code->bits);
-  } else if (!code->raw.empty()) {
-    irSender.sendRaw(code->raw.data(), code->raw.size(), code->frequency);
-  } else {
-    server.send(500, "text/plain", "Code has no data");
-    return;
-  }
-  server.send(200, "application/json", "{\"status\":\"sent\"}");
-}
-
-void handleDelete() {
+static void handleCodesDelete() {
   String name = server.arg("name");
-  if (!name.length()) {
-    server.send(400, "text/plain", "Parameter 'name' je povinný");
+  if (!name.length()) { server.send(400, "application/json", "{\"error\":\"Missing name\"}"); return; }
+  int idx = findCodeIndex(name);
+  if (idx < 0) { server.send(404, "application/json", "{\"error\":\"Not found\"}"); return; }
+  g_codes.erase(g_codes.begin() + idx);
+  saveCodes();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleLearnPost() {
+  if (server.arg("plain").isEmpty()) {
+    server.send(400, "application/json", "{\"error\":\"Missing JSON body\"}");
     return;
   }
-  for (auto it = codes.begin(); it != codes.end(); ++it) {
-    if (it->name.equalsIgnoreCase(name)) {
-      codes.erase(it);
-      saveCodes();
-      server.send(200, "application/json", "{\"status\":\"deleted\"}");
-      return;
-    }
-  }
-  server.send(404, "text/plain", "Code not found");
+  DynamicJsonDocument in(512);
+  DeserializationError e = deserializeJson(in, server.arg("plain"));
+  if (e) { server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}"); return; }
+
+  String name = in["name"] | "";
+  if (!name.length()) { server.send(400, "application/json", "{\"error\":\"Missing name\"}"); return; }
+
+  learn.active      = true;
+  learn.pendingName = name;
+  learn.startedMs   = millis();
+  learn.timeoutMs   = strtoul(p_learnTimeout.getValue(), nullptr, 10);
+  irrecv.enableIRIn();   // jistota, že je RX zapnutý
+
+  DynamicJsonDocument out(256);
+  out["ok"] = true; out["learning"] = true;
+  String s; serializeJson(out, s);
+  server.send(200, "application/json", s);
 }
 
-void syncConfigFromParams() {
-  deviceConfig.deviceName = String(deviceNameParam.getValue());
-  unsigned long timeout = strtoul(learnTimeoutParam.getValue(), nullptr, 10);
-  if (timeout < kMinimumLearnTimeoutMs) {
-    timeout = kMinimumLearnTimeoutMs;
-  }
-  deviceConfig.learnTimeoutMs = timeout;
-  deviceConfig.deviceName.trim();
-  if (!deviceConfig.deviceName.length()) {
-    deviceConfig.deviceName = F("ESP IR Controller");
-  }
-  snprintf(deviceNameBuffer, sizeof(deviceNameBuffer), "%s", deviceConfig.deviceName.c_str());
-  snprintf(learnTimeoutBuffer, sizeof(learnTimeoutBuffer), "%lu", deviceConfig.learnTimeoutMs);
-}
-
-void saveConfigIfNeeded() {
-  if (!shouldPersistConfig) {
+static void handleSendPost() {
+  if (server.arg("plain").isEmpty()) {
+    server.send(400, "application/json", "{\"error\":\"Missing JSON body\"}");
     return;
   }
-  shouldPersistConfig = false;
-  syncConfigFromParams();
-  saveDeviceConfig();
-  Serial.println(F("Konfigurace uložena."));
-}
+  DynamicJsonDocument in(512);
+  if (deserializeJson(in, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  String name = in["name"] | "";
+  if (!name.length()) { server.send(400, "application/json", "{\"error\":\"Missing name\"}"); return; }
 
-void handleWiFi() {
-  wifiManager.process();
+  int idx = findCodeIndex(name);
+  if (idx < 0) { server.send(404, "application/json", "{\"error\":\"Code not found\"}"); return; }
+  const StoredCode& c = g_codes[idx];
 
-  if (wifiConnected()) {
-    if (!wifiWasConnected) {
-      wifiWasConnected = true;
-      Serial.print(F("Wi-Fi připojeno, IP adresa: "));
-      Serial.println(WiFi.localIP());
-      syncConfigFromParams();
-      saveDeviceConfig();
-    }
+  // Preferuj RAW – univerzální
+  if (!c.raw.empty()) {
+    std::vector<uint16_t> raw16; raw16.reserve(c.raw.size());
+    for (auto us : c.raw) raw16.push_back((uint16_t)std::min<uint32_t>(us, 0xFFFF));
+
+    irsend.begin();
+    delay(10);
+    irsend.sendRaw(raw16.data(), raw16.size(), c.khz);
+  } else if (c.protocol == "NEC") {
+    irsend.begin(); delay(10);
+    irsend.sendNEC(c.value, c.bits);
   } else {
-    if (wifiWasConnected) {
-      Serial.println(F("Wi-Fi odpojeno"));
-    }
-    wifiWasConnected = false;
+    server.send(500, "application/json", "{\"error\":\"Code has no RAW and unsupported protocol\"}");
+    return;
   }
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ===== Uložení přijatého kódu =====
+static void handleCapturedCode(const decode_results& results) {
+  StoredCode code = resultsToStored(results, learn.pendingName);
+
+  int idx = findCodeIndex(code.name);
+  if (idx >= 0) g_codes[idx] = std::move(code);
+  else g_codes.push_back(std::move(code));
+
+  saveCodes();
+
+  learn.lastCaptured = learn.pendingName;
+  learn.pendingName  = "";
+  learn.active       = false;
+}
+
+// ===== Setup & Loop =====
+static void setupFS() {
+#if defined(ESP8266)
+  LITTLEFS.begin();
+#else
+  LITTLEFS.begin(true);  // ESP32: auto-format on fail
+#endif
+}
+
+static void setupWiFi() {
+  wm.setClass("invert");
+  wm.addParameter(&p_devName);
+  wm.addParameter(&p_learnTimeout);
+  wm.setConfigPortalBlocking(true);
+  wm.setConnectTimeout(30);
+  wm.setConfigPortalTimeout(180);
+
+  if (!wm.autoConnect("ESP-IR-Bridge", "esp-ir-bridge")) {
+    ESP.restart();
+  }
+  saveSettings();
+}
+
+static void setupHTTP() {
+  server.on("/",             HTTP_GET,    handleRoot);
+  server.on("/api/status",   HTTP_GET,    handleStatus);
+  server.on("/api/codes",    HTTP_GET,    handleCodesList);
+  server.on("/api/codes",    HTTP_DELETE, handleCodesDelete);
+  server.on("/api/learn",    HTTP_POST,   handleLearnPost);
+  server.on("/api/send",     HTTP_POST,   handleSendPost);
+  server.begin();
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(50);
   Serial.println();
-  Serial.println(F("Startuji ESP IR kontrolér"));
+  Serial.println(F("== ESP IR Bridge start =="));
 
-  WiFi.mode(WIFI_STA);
-
-#if defined(ESP8266)
-  fsReady = LITTLEFS.begin();
-#elif defined(ESP32)
-  fsReady = LITTLEFS.begin(true);
-#endif
-  if (!fsReady) {
-    Serial.println(F("Nelze připojit souborový systém LittleFS"));
-  }
-  loadDeviceConfig();
+  setupFS();
+  loadSettings();
   loadCodes();
 
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.setSaveParamsCallback([]() {
-    shouldPersistConfig = true;
-  });
+  setupWiFi();
 
-  snprintf(deviceNameBuffer, sizeof(deviceNameBuffer), "%s", deviceConfig.deviceName.c_str());
-  snprintf(learnTimeoutBuffer, sizeof(learnTimeoutBuffer), "%lu", deviceConfig.learnTimeoutMs);
-  wifiManager.addParameter(&deviceNameParam);
-  wifiManager.addParameter(&learnTimeoutParam);
+  irrecv.enableIRIn();
+  irsend.begin();
 
-  if (!wifiManager.autoConnect("ESP-IR-Setup")) {
-    Serial.println(F("Nelze se připojit k Wi-Fi, čekám na konfiguraci."));
-  } else {
-    wifiWasConnected = true;
-    Serial.print(F("Wi-Fi připojeno, IP adresa: "));
-    Serial.println(WiFi.localIP());
-    syncConfigFromParams();
-    saveDeviceConfig();
-  }
+  setupHTTP();
 
-  WiFi.setAutoReconnect(true);
-
-  irReceiver.enableIRIn();
-  irSender.begin();
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/codes", HTTP_GET, handleGetCodes);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/learn", HTTP_POST, handleLearn);
-  server.on("/api/send", HTTP_POST, handleSend);
-  server.on("/api/codes", HTTP_DELETE, handleDelete);
-  server.begin();
-  Serial.println(F("HTTP server spuštěn"));
+  Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
 }
 
 void loop() {
-  handleWiFi();
-  saveConfigIfNeeded();
   server.handleClient();
 
-  if (learningActive && millis() - learningStarted > deviceConfig.learnTimeoutMs) {
-    Serial.println(F("Učení vypršelo."));
-    cancelLearning();
-  }
-
-  decode_results results;
-  if (irReceiver.decode(&results)) {
-    if (learningActive) {
-      handleCapturedCode(results);
+  if (learn.active) {
+    if (millis() - learn.startedMs > learn.timeoutMs) {
+      // Timeout učení
+      learn.active = false;
+      learn.pendingName = "";
+      Serial.println(F("Learn timeout."));
+    } else {
+      decode_results results;
+      if (irrecv.decode(&results)) {
+        Serial.println(resultToHumanReadableBasic(&results));
+        handleCapturedCode(results);
+        irrecv.resume();  // připravit na další přijem
+      }
     }
-    irReceiver.resume();
+  } else {
+    // Nepovinně: pasivně čistíme RX buffer (bez zpracování)
+    decode_results dummy;
+    if (irrecv.decode(&dummy)) {
+      irrecv.resume();
+    }
   }
 }
