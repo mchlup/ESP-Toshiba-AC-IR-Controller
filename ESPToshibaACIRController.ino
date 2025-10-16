@@ -51,6 +51,11 @@ WiFiManager wm;
 WiFiManagerParameter p_devName("devname", "Název zařízení", "ESP-IR-Bridge", 32);
 WiFiManagerParameter p_learnTimeout("learntimeout", "Timeout učení (ms)", "60000", 10);
 
+static bool g_wifiConnected = false;
+static bool g_httpStarted = false;
+static bool g_shouldSaveSettings = false;
+static bool g_configPortalStarted = false;
+
 // Webserver
 WebServerType server(80);
 
@@ -326,6 +331,7 @@ static void setupFS() {
 
 static void setupWiFi() {
   wm.setAPCallback([](WiFiManager* manager) {
+    g_configPortalStarted = true;
     Serial.println(F("-- WiFiManager config portal --"));
     Serial.print(F("  SSID: "));
     Serial.println(manager->getConfigPortalSSID());
@@ -333,20 +339,25 @@ static void setupWiFi() {
     Serial.println(WiFi.softAPIP());
     Serial.println(F("  AP security: open (no password)"));
   });
+  wm.setSaveConfigCallback([]() {
+    g_shouldSaveSettings = true;
+  });
   wm.setClass("invert");
   wm.addParameter(&p_devName);
   wm.addParameter(&p_learnTimeout);
-  wm.setConfigPortalBlocking(true);
-  wm.setConnectTimeout(30);
+  wm.setConfigPortalBlocking(false);
   wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(30);
+  wm.setConfigPortalPassword((const char*)nullptr);  // otevřená síť
 
   Serial.println(F("Connecting via WiFiManager..."));
-  if (!wm.autoConnect("ESP-IR-Bridge")) {
-    Serial.println(F("WiFiManager failed to connect, rebooting."));
-    ESP.restart();
+  if (wm.autoConnect("ESP-IR-Bridge")) {
+    Serial.println(F("WiFiManager connected."));
+    g_wifiConnected = true;
+    g_shouldSaveSettings = true;
+  } else {
+    Serial.println(F("WiFiManager waiting for configuration portal or connection."));
   }
-  Serial.println(F("WiFiManager connected."));
-  saveSettings();
 }
 
 static void setupHTTP() {
@@ -357,6 +368,14 @@ static void setupHTTP() {
   server.on("/api/learn",    HTTP_POST,   handleLearnPost);
   server.on("/api/send",     HTTP_POST,   handleSendPost);
   server.begin();
+}
+
+static void maybeStartHTTP() {
+  if (!g_wifiConnected || g_httpStarted) return;
+  setupHTTP();
+  g_httpStarted = true;
+  Serial.print(F("IP: "));
+  Serial.println(WiFi.localIP());
 }
 
 void setup() {
@@ -374,13 +393,48 @@ void setup() {
   irrecv.enableIRIn();
   irsend.begin();
 
-  setupHTTP();
+  maybeStartHTTP();
 
-  Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
+  if (!g_wifiConnected) {
+    Serial.println(F("Waiting for WiFi connection or configuration portal."));
+  }
 }
 
 void loop() {
-  server.handleClient();
+  wm.process();
+
+  if (!g_wifiConnected && WiFi.status() == WL_CONNECTED) {
+    g_wifiConnected = true;
+    Serial.println(F("WiFiManager connected."));
+    g_shouldSaveSettings = true;
+  }
+
+  if (g_shouldSaveSettings) {
+    g_shouldSaveSettings = false;
+    if (saveSettings()) {
+      learn.timeoutMs = strtoul(p_learnTimeout.getValue(), nullptr, 10);
+      Serial.println(F("Settings saved."));
+    } else {
+      Serial.println(F("Failed to save settings."));
+    }
+  }
+
+  maybeStartHTTP();
+
+  if (g_httpStarted) {
+    server.handleClient();
+  }
+
+  static bool restartScheduled = false;
+  static unsigned long restartAt = 0;
+  if (!g_wifiConnected && g_configPortalStarted && !wm.getConfigPortalActive() && WiFi.status() != WL_CONNECTED && !restartScheduled) {
+    Serial.println(F("WiFiManager failed to connect, rebooting."));
+    restartScheduled = true;
+    restartAt = millis() + 500;
+  }
+  if (restartScheduled && millis() >= restartAt) {
+    ESP.restart();
+  }
 
   if (learn.active) {
     if (millis() - learn.startedMs > learn.timeoutMs) {
