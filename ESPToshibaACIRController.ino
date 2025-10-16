@@ -332,7 +332,7 @@ static void setupWiFi() {
   wm.setConnectTimeout(30);
   wm.setConfigPortalTimeout(180);
 
-  if (!wm.autoConnect("ESP-IR-Bridge", "esp-ir-bridge")) {
+  if (!wm.autoConnect("ESP-IR-Bridge")) {
     ESP.restart();
   }
   saveSettings();

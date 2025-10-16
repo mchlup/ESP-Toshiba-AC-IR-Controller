@@ -29,7 +29,7 @@ Firmware pro ESP8266/ESP32, které umožňuje učit se IR kódy z libovolných o
    - `LittleFS` (ESP8266 používá vestavěnou implementaci, pro ESP32 nainstalujte knihovnu [LittleFS_esp32](https://github.com/lorol/LITTLEFS)).
 4. Nahrajte firmware standardním tlačítkem **Nahrát**.
 
-Po nahrání se zařízení přepne do režimu konfigurace Wi-Fi (přístupový bod `ESP-IR-Setup`). Připojte se k němu, otevřete `http://192.168.4.1/` a v portálu WiFiManageru zadejte přístupové údaje k vaší síti. Na stejné stránce najdete také vlastní parametry:
+Po nahrání se zařízení přepne do režimu konfigurace Wi-Fi (přístupový bod `ESP-IR-Bridge`, bez hesla). Připojte se k němu, otevřete `http://192.168.4.1/` a v portálu WiFiManageru zadejte přístupové údaje k vaší síti. Na stejné stránce najdete také vlastní parametry:
 
 - **Název zařízení** – text použitý v uživatelském rozhraní a odpovědích API.
 - **Doba učení (ms)** – maximální délka čekání na zachycení IR kódu.
