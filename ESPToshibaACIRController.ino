@@ -6,6 +6,9 @@
 #include <Preferences.h>     // NVS (nastavení)
 #include <LittleFS.h>        // souborový systém pro "learned" databázi
 #include <FS.h>
+#include <vector>
+
+String jsonEscape(const String& s);
 
 // ====== HW ======
 static const uint8_t IR_RX_PIN = 10;   // ESP32-C3: funguje i 4/5/10
@@ -41,6 +44,7 @@ struct IREvent {
   uint16_t command;
   uint32_t value;
   uint32_t flags;
+  int16_t learnedIndex; // index do cache naučených kódů, -1 pokud neexistuje
 };
 static const size_t HISTORY_LEN = 10;
 static IREvent history[HISTORY_LEN];
@@ -49,13 +53,175 @@ static size_t histCount = 0;
 
 // Poslední validní UNKNOWN pro “Learn”
 static bool   hasLastUnknown = false;
-static IREvent lastUnknown = {0};
+static IREvent lastUnknown = {0, UNKNOWN, 0, 0, 0, 0, 0, -1};
 
 // Stav pro dup filtr
 static uint32_t lastValue = 0;
 static decode_type_t lastProto = UNKNOWN;
 static uint8_t lastBits = 0;
 static uint32_t lastMs = 0;
+
+// ====== Learned cache ======
+struct LearnedCode {
+  uint32_t value;
+  uint8_t bits;
+  uint32_t addr;
+  String proto;
+  String vendor;
+  String function;
+  String remote;
+};
+
+static std::vector<LearnedCode> g_learnedCache;
+static bool g_learnedCacheValid = false;
+
+void invalidateLearnedCache() {
+  g_learnedCacheValid = false;
+}
+
+static bool isWhitespace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out) {
+  String pattern = String('"') + key + String("":");
+  int idx = line.indexOf(pattern);
+  if (idx < 0) return false;
+  idx += pattern.length();
+  while (idx < (int)line.length() && isWhitespace(line[idx])) idx++;
+  if (idx >= (int)line.length()) return false;
+  bool hasDigit = false;
+  uint32_t value = 0;
+  while (idx < (int)line.length()) {
+    char c = line[idx];
+    if (c >= '0' && c <= '9') {
+      hasDigit = true;
+      value = value * 10 + (c - '0');
+      idx++;
+    } else {
+      break;
+    }
+  }
+  if (!hasDigit) return false;
+  out = value;
+  return true;
+}
+
+static bool jsonExtractString(const String &line, const char *key, String &out) {
+  String pattern = String('"') + key + String("":"");
+  int idx = line.indexOf(pattern);
+  if (idx < 0) return false;
+  idx += pattern.length();
+  String result;
+  while (idx < (int)line.length()) {
+    char c = line[idx++];
+    if (c == '\\') {
+      if (idx >= (int)line.length()) break;
+      char esc = line[idx++];
+      switch (esc) {
+        case '"': result += '"'; break;
+        case '\\': result += '\\'; break;
+        case '/': result += '/'; break;
+        case 'b': result += '\b'; break;
+        case 'f': result += '\f'; break;
+        case 'n': result += '\n'; break;
+        case 'r': result += '\r'; break;
+        case 't': result += '\t'; break;
+        default:  result += esc; break;
+      }
+    } else if (c == '"') {
+      out = result;
+      return true;
+    } else {
+      result += c;
+    }
+  }
+  return false;
+}
+
+void ensureLearnedCacheLoaded() {
+  if (g_learnedCacheValid) return;
+
+  g_learnedCache.clear();
+
+  File f = LittleFS.open(LEARN_FILE, FILE_READ);
+  if (!f) {
+    g_learnedCacheValid = true;
+    return;
+  }
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+
+    LearnedCode entry = {};
+    uint32_t tmp = 0;
+    if (jsonExtractUint32(line, "value", entry.value)) {
+      if (jsonExtractUint32(line, "bits", tmp)) entry.bits = static_cast<uint8_t>(tmp & 0xFF);
+      if (jsonExtractUint32(line, "addr", entry.addr)) {
+        jsonExtractString(line, "proto", entry.proto);
+        jsonExtractString(line, "vendor", entry.vendor);
+        jsonExtractString(line, "function", entry.function);
+        jsonExtractString(line, "remote_label", entry.remote);
+        g_learnedCache.push_back(entry);
+      }
+    }
+  }
+  f.close();
+  g_learnedCacheValid = true;
+}
+
+const LearnedCode* getLearnedByIndex(int16_t idx) {
+  ensureLearnedCacheLoaded();
+  if (idx < 0) return nullptr;
+  if (idx >= static_cast<int16_t>(g_learnedCache.size())) return nullptr;
+  return &g_learnedCache[idx];
+}
+
+int16_t findLearnedIndex(uint32_t value, uint8_t bits, uint32_t addr) {
+  ensureLearnedCacheLoaded();
+  for (size_t i = 0; i < g_learnedCache.size(); i++) {
+    const LearnedCode &entry = g_learnedCache[i];
+    if (entry.value == value && entry.bits == bits && entry.addr == addr) {
+      return static_cast<int16_t>(i);
+    }
+  }
+  return -1;
+}
+
+const LearnedCode* findLearnedMatch(const IRData &d, int16_t *outIndex) {
+  int16_t idx = findLearnedIndex(d.decodedRawData, d.numberOfBits, d.address);
+  if (outIndex) *outIndex = idx;
+  return idx >= 0 ? &g_learnedCache[idx] : nullptr;
+}
+
+void refreshLearnedAssociations() {
+  ensureLearnedCacheLoaded();
+  for (size_t i = 0; i < histCount; i++) {
+    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
+    IREvent &e = history[idx];
+    e.learnedIndex = findLearnedIndex(e.value, e.bits, e.address);
+  }
+  if (hasLastUnknown) {
+    int16_t idx = findLearnedIndex(lastUnknown.value, lastUnknown.bits, lastUnknown.address);
+    if (idx >= 0) {
+      hasLastUnknown = false;
+      lastUnknown.learnedIndex = idx;
+    } else {
+      lastUnknown.learnedIndex = -1;
+    }
+  }
+}
+
+static bool isEffectivelyUnknown(decode_type_t proto, const LearnedCode *learned) {
+  return proto == UNKNOWN && !(learned && learned->proto.length());
+}
+
+static bool isEffectivelyUnknown(const IREvent &e) {
+  const LearnedCode *learned = getLearnedByIndex(e.learnedIndex);
+  return isEffectivelyUnknown(e.proto, learned);
+}
 
 // ====== Pomocné ======
 const __FlashStringHelper* protoName(decode_type_t p) {
@@ -68,7 +234,7 @@ const __FlashStringHelper* protoName(decode_type_t p) {
   }
 }
 
-void addToHistory(const IRData &d) {
+void addToHistory(const IRData &d, int16_t learnedIndex) {
   IREvent e;
   e.ms      = millis();
   e.proto   = d.protocol;
@@ -77,29 +243,46 @@ void addToHistory(const IRData &d) {
   e.command = d.command;
   e.value   = d.decodedRawData;
   e.flags   = d.flags;
+  e.learnedIndex = learnedIndex;
 
   history[histWrite] = e;
   histWrite = (histWrite + 1) % HISTORY_LEN;
   if (histCount < HISTORY_LEN) histCount++;
 }
 
-void printLine(const IRData &d, bool isRepeatSuppressed) {
-  if (g_showOnlyUnknown && d.protocol != UNKNOWN) return; // nezahlcuj log, když filtr aktivní
+void printLine(const IRData &d, bool isRepeatSuppressed, const LearnedCode *learned) {
+  if (g_showOnlyUnknown && !isEffectivelyUnknown(d.protocol, learned)) return; // nezahlcuj log, když filtr aktivní
   Serial.print(F("[IR] "));
-  Serial.print(protoName(d.protocol));
+  if (learned && learned->proto.length()) Serial.print(learned->proto);
+  else Serial.print(protoName(d.protocol));
   Serial.print(F(" bits=")); Serial.print(d.numberOfBits);
   Serial.print(F(" addr=0x")); Serial.print(d.address, HEX);
   Serial.print(F(" cmd=0x")); Serial.print(d.command, HEX);
   Serial.print(F(" value=0x")); Serial.print(d.decodedRawData, HEX);
   if (d.flags & IRDATA_FLAGS_IS_REPEAT) Serial.print(F(" (REPEAT)"));
   if (isRepeatSuppressed) Serial.print(F(" (suppressed)"));
+  if (learned) {
+    Serial.print(F(" [learned"));
+    if (learned->function.length()) {
+      Serial.print(F(" function='"));
+      Serial.print(learned->function);
+      Serial.print(F("'"));
+    }
+    if (learned->vendor.length()) {
+      Serial.print(F(" vendor='"));
+      Serial.print(learned->vendor);
+      Serial.print(F("'"));
+    }
+    Serial.print(F("]"));
+  }
   Serial.println();
 }
 
-void printJSON(const IRData &d) {
-  if (g_showOnlyUnknown && d.protocol != UNKNOWN) return; // respektuj filtr i pro JSON log
+void printJSON(const IRData &d, const LearnedCode *learned) {
+  if (g_showOnlyUnknown && !isEffectivelyUnknown(d.protocol, learned)) return; // respektuj filtr i pro JSON log
   Serial.print(F("{\"proto\":\""));
-  Serial.print(protoName(d.protocol));
+  if (learned && learned->proto.length()) Serial.print(jsonEscape(learned->proto));
+  else Serial.print(protoName(d.protocol));
   Serial.print(F("\",\"bits\":"));
   Serial.print(d.numberOfBits);
   Serial.print(F(",\"addr\":"));
@@ -112,6 +295,17 @@ void printJSON(const IRData &d) {
   Serial.print((uint32_t)d.flags);
   Serial.print(F(",\"ms\":"));
   Serial.print(millis());
+  Serial.print(F(",\"learned\":"));
+  Serial.print(learned ? "true" : "false");
+  Serial.print(F(",\"learned_proto\":\""));
+  if (learned && learned->proto.length()) Serial.print(jsonEscape(learned->proto));
+  Serial.print(F("\",\"learned_vendor\":\""));
+  if (learned && learned->vendor.length()) Serial.print(jsonEscape(learned->vendor));
+  Serial.print(F("\",\"learned_function\":\""));
+  if (learned && learned->function.length()) Serial.print(jsonEscape(learned->function));
+  Serial.print(F("\",\"learned_remote\":\""));
+  if (learned && learned->remote.length()) Serial.print(jsonEscape(learned->remote));
+  Serial.print('"');
   Serial.println(F("}"));
 }
 
@@ -189,7 +383,12 @@ bool fsAppendLearned(uint32_t value,
 
   size_t w = f.print(line);
   f.close();
-  return w == line.length();
+  bool ok = (w == line.length());
+  if (ok) {
+    invalidateLearnedCache();
+    refreshLearnedAssociations();
+  }
+  return ok;
 }
 
 // Vrátí JSON array všech naučených kódů
@@ -264,14 +463,16 @@ void handleRoot() {
   for (size_t i = 0; i < histCount; i++) {
     size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
     const IREvent &e = history[idx];
-    if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
+    const LearnedCode *learned = getLearnedByIndex(e.learnedIndex);
+    if (g_showOnlyUnknown && !isEffectivelyUnknown(e)) continue;
 
     html += F("<tr><td>");
     html += ++shown;
     html += F("</td><td>");
     html += e.ms;
     html += F("</td><td>");
-    html += protoName(e.proto);
+    if (learned && learned->proto.length()) html += learned->proto;
+    else html += String(protoName(e.proto));
     html += F("</td><td>");
     html += static_cast<uint32_t>(e.bits);
     html += F("</td><td><code>0x");
@@ -284,7 +485,7 @@ void handleRoot() {
     html += e.flags;
     html += F("</td><td>");   // === Akce ===
 
-    if (e.proto == UNKNOWN) {
+    if (isEffectivelyUnknown(e)) {
       html += F("<button class='btn' onclick=\"openLearn(");
       html += static_cast<uint32_t>(e.value);   html += F(",");
       html += static_cast<uint32_t>(e.bits);    html += F(",");
@@ -292,6 +493,16 @@ void handleRoot() {
       html += static_cast<uint32_t>(e.flags);   html += F(",");
       html += F("'UNKNOWN'");
       html += F(")\">Učit</button>");
+    } else if (learned) {
+      html += F("<span class='muted'>");
+      if (learned->function.length()) html += learned->function;
+      else html += F("Naučený kód");
+      if (learned->vendor.length()) {
+        html += F(" (");
+        html += learned->vendor;
+        html += F(")");
+      }
+      html += F("</span>");
     } else {
       html += F("<span class='muted'>—</span>");
     }
@@ -374,16 +585,28 @@ void handleJsonHistory() {
   for (size_t i = 0; i < histCount; i++) {
     size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
     const IREvent &e = history[idx];
-    if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
+    const LearnedCode *learned = getLearnedByIndex(e.learnedIndex);
+    if (g_showOnlyUnknown && !isEffectivelyUnknown(e)) continue;
     if (!first) out += ',';
     out += F("{\"ms\":"); out += e.ms;
     out += F(",\"proto\":\"");
-    out += protoName(e.proto);
+    String protoStr = learned && learned->proto.length() ? learned->proto : String(protoName(e.proto));
+    out += jsonEscape(protoStr);
     out += F("\",\"bits\":"); out += static_cast<uint32_t>(e.bits);
     out += F(",\"addr\":"); out += e.address;
     out += F(",\"cmd\":");  out += e.command;
     out += F(",\"value\":");out += e.value;
     out += F(",\"flags\":");out += e.flags;
+    out += F(",\"learned\":"); out += learned ? "true" : "false";
+    out += F(",\"learned_proto\":\"");
+    if (learned && learned->proto.length()) out += jsonEscape(learned->proto);
+    out += F("\",\"learned_vendor\":\"");
+    if (learned && learned->vendor.length()) out += jsonEscape(learned->vendor);
+    out += F("\",\"learned_function\":\"");
+    if (learned && learned->function.length()) out += jsonEscape(learned->function);
+      out += F(",\"learned_remote\":\"");
+    if (learned && learned->remote.length()) out += jsonEscape(learned->remote);
+    out += '"';
     out += F("}");
     first = false;
   }
@@ -617,8 +840,12 @@ void loop() {
     }
   }
 
+  int16_t learnedIndex = -1;
+  const LearnedCode *learned = findLearnedMatch(d, &learnedIndex);
+  const bool effectiveUnknown = isEffectivelyUnknown(d.protocol, learned);
+
   // Pokud chceme učit UNKNOWN, ulož poslední zachycený UNKNOWN (ne-suppressnutý)
-  if (d.protocol == UNKNOWN && !suppress) {
+  if (effectiveUnknown && !suppress) {
     hasLastUnknown = true;
     lastUnknown.ms      = now;
     lastUnknown.proto   = UNKNOWN;
@@ -627,13 +854,14 @@ void loop() {
     lastUnknown.command = d.command;
     lastUnknown.value   = d.decodedRawData;
     lastUnknown.flags   = d.flags;
+    lastUnknown.learnedIndex = -1;
   }
 
   // Log + historie (respektuj filtr v print funkcích; do historie ukládáme vždy “nesuppressnuté”)
-  printLine(d, suppress);
+  printLine(d, suppress, learned);
   if (!suppress) {
-    printJSON(d);
-    addToHistory(d);
+    printJSON(d, learned);
+    addToHistory(d, learnedIndex);
   }
 
   // update dup stav
