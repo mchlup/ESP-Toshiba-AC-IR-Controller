@@ -10,6 +10,7 @@
 
 struct LearnedCode;
 struct IREvent;
+struct LearnedLineDetails;
 
 String jsonEscape(const String& s);
 
