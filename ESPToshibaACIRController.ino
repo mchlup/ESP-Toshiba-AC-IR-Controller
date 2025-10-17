@@ -7,6 +7,7 @@
 #include <LittleFS.h>        // souborový systém pro "learned" databázi
 #include <FS.h>
 #include <vector>
+#include <unordered_map>
 
 // ========= PŘEDDEKLARACE / GLOBÁLY (pořadí důležité) =========
 
@@ -79,6 +80,30 @@ static uint32_t lastMs = 0;
 // ====== Learned cache ======
 
 // FIX: LearnedCode musí být kompletní dřív, než se použije v irSendLearned()
+struct LearnedKey {
+  uint32_t value;
+  uint32_t addr;
+  uint8_t bits;
+
+  bool operator==(const LearnedKey &o) const {
+    return value == o.value && addr == o.addr && bits == o.bits;
+  }
+};
+
+struct LearnedKeyHash {
+  size_t operator()(const LearnedKey &k) const {
+    size_t h = static_cast<size_t>(k.value);
+    h ^= static_cast<size_t>(k.addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= static_cast<size_t>(k.bits) * 0x27d4eb2d;
+    return h;
+  }
+};
+
+static LearnedKey makeLearnedKey(uint32_t value, uint8_t bits, uint32_t addr) {
+  LearnedKey key{value, addr, bits};
+  return key;
+}
+
 struct LearnedCode {
   uint32_t value;
   uint8_t  bits;
@@ -90,9 +115,13 @@ struct LearnedCode {
 };
 
 static std::vector<LearnedCode> g_learnedCache;
+static std::unordered_map<LearnedKey, int16_t, LearnedKeyHash> g_learnedIndex;
 static bool g_learnedCacheValid = false;
 
-void invalidateLearnedCache() { g_learnedCacheValid = false; }
+void invalidateLearnedCache() {
+  g_learnedCacheValid = false;
+  g_learnedIndex.clear();
+}
 void ensureLearnedCacheLoaded();
 const LearnedCode* getLearnedByIndex(int16_t idx);
 int16_t findLearnedIndex(uint32_t value, uint8_t bits, uint32_t addr);
@@ -514,6 +543,7 @@ String fsReadLearnedAsArrayJSON() {
 void ensureLearnedCacheLoaded() {
   if (g_learnedCacheValid) return;
   g_learnedCache.clear();
+  g_learnedIndex.clear();
 
   File f = LittleFS.open(LEARN_FILE, FILE_READ);
   if (!f) { g_learnedCacheValid = true; return; }
@@ -533,6 +563,9 @@ void ensureLearnedCacheLoaded() {
         jsonExtractString(line, "function", entry.function);
         jsonExtractString(line, "remote_label", entry.remote);
         g_learnedCache.push_back(entry);
+        const int16_t idx = static_cast<int16_t>(g_learnedCache.size() - 1);
+        LearnedKey key = makeLearnedKey(entry.value, entry.bits, entry.addr);
+        g_learnedIndex.emplace(key, idx);
       }
     }
   }
@@ -549,13 +582,10 @@ const LearnedCode* getLearnedByIndex(int16_t idx) {
 
 int16_t findLearnedIndex(uint32_t value, uint8_t bits, uint32_t addr) {
   ensureLearnedCacheLoaded();
-  for (size_t i = 0; i < g_learnedCache.size(); i++) {
-    const LearnedCode &entry = g_learnedCache[i];
-    if (entry.value == value && entry.bits == bits && entry.addr == addr) {
-      return static_cast<int16_t>(i);
-    }
-  }
-  return -1;
+  LearnedKey key = makeLearnedKey(value, bits, addr);
+  auto it = g_learnedIndex.find(key);
+  if (it == g_learnedIndex.end()) return -1;
+  return it->second;
 }
 
 const LearnedCode* findLearnedMatch(const IRData &d, int16_t *outIndex) {
