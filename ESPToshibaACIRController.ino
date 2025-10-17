@@ -82,6 +82,25 @@ void invalidateLearnedCache() {
   g_learnedCacheValid = false;
 }
 
+struct LearnedLineDetails {
+  uint32_t ts;
+  uint32_t value;
+  uint8_t bits;
+  uint32_t addr;
+  uint32_t flags;
+};
+
+static bool parseLearnedLineNumbers(const String &line, LearnedLineDetails &out) {
+  uint32_t tmp = 0;
+  if (!jsonExtractUint32(line, "ts", out.ts)) return false;
+  if (!jsonExtractUint32(line, "value", out.value)) return false;
+  if (!jsonExtractUint32(line, "bits", tmp)) return false;
+  out.bits = static_cast<uint8_t>(tmp & 0xFF);
+  if (!jsonExtractUint32(line, "addr", out.addr)) return false;
+  if (!jsonExtractUint32(line, "flags", out.flags)) out.flags = 0;
+  return true;
+}
+
 static bool isWhitespace(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
@@ -386,6 +405,65 @@ bool fsAppendLearned(uint32_t value,
   size_t w = f.print(line);
   f.close();
   bool ok = (w == line.length());
+  if (ok) {
+    invalidateLearnedCache();
+    refreshLearnedAssociations();
+  }
+  return ok;
+}
+
+bool fsUpdateLearned(size_t index,
+                     const String &protoStr,
+                     const String &vendor,
+                     const String &functionName,
+                     const String &remoteLabel) {
+  File f = LittleFS.open(LEARN_FILE, FILE_READ);
+  if (!f) return false;
+
+  std::vector<String> lines;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    lines.push_back(line);
+  }
+  f.close();
+
+  if (index >= lines.size()) return false;
+
+  LearnedLineDetails details;
+  if (!parseLearnedLineNumbers(lines[index], details)) return false;
+
+  String proto = protoStr.length() ? protoStr : String("UNKNOWN");
+
+  String line;
+  line.reserve(320);
+  line += '{';
+  line += F("\"ts\":");         line += details.ts;
+  line += F(",\"proto\":\""); line += proto;                    line += '"';
+  line += F(",\"value\":");     line += details.value;
+  line += F(",\"bits\":");      line += static_cast<uint32_t>(details.bits);
+  line += F(",\"addr\":");      line += details.addr;
+  line += F(",\"flags\":");     line += details.flags;
+  line += F(",\"vendor\":\""); line += jsonEscape(vendor);        line += '"';
+  line += F(",\"function\":\""); line += jsonEscape(functionName); line += '"';
+  line += F(",\"remote_label\":\"");
+  line += jsonEscape(remoteLabel);
+  line += F("\"}");
+
+  lines[index] = line;
+
+  File out = LittleFS.open(LEARN_FILE, FILE_WRITE);
+  if (!out) return false;
+
+  bool ok = true;
+  for (size_t i = 0; i < lines.size(); i++) {
+    size_t w = out.print(lines[i]);
+    if (w != lines[i].length()) { ok = false; break; }
+    if (out.print('\n') != 1) { ok = false; break; }
+  }
+  out.close();
+
   if (ok) {
     invalidateLearnedCache();
     refreshLearnedAssociations();
@@ -698,7 +776,7 @@ void handleLearnedList() {
   // jednoduchý výpis z JSONL jako tabulka
   String data = fsReadLearnedAsArrayJSON();
   // Sestav HTML s minimálním parserem na straně klienta (JS) – jednodušší
-  String html; html.reserve(4000);
+  String html; html.reserve(7000);
   html += F(
     "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -709,24 +787,83 @@ void handleLearnedList() {
     "th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}"
     "th{background:#f5f5f5}"
     "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    "a.btn,button.btn{display:inline-block;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa;text-decoration:none;color:#222}"
+    "#editModal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)}"
+    "#editModal .card{background:#fff;padding:16px 16px 12px;border-radius:10px;min-width:320px;max-width:90vw}"
+    "#editModal label{display:block;margin:6px 0 2px;font-size:14px}"
+    "#editModal input[type=text]{width:100%;padding:6px 8px;font-size:14px}"
     "</style></head><body>"
     "<h1>Naučené kódy</h1>"
     "<table><thead><tr>"
     "<th>#</th><th>vendor</th><th>proto</th><th>function</th><th>remote_label</th>"
-    "<th>bits</th><th>addr</th><th>value</th><th>flags</th>"
+    "<th>bits</th><th>addr</th><th>value</th><th>flags</th><th>Akce</th>"
     "</tr></thead><tbody id='tb'></tbody></table>"
     "<p><a href='/'>← Domů</a></p>"
+    "<div id='editModal'><div class='card'>"
+      "<h3 style='margin:0 0 8px;font-size:16px'>Upravit kód</h3>"
+      "<form id='editForm'>"
+        "<input type='hidden' name='index'>"
+        "<label>Protokol:</label><input type='text' name='proto' placeholder='např. NEC' required>"
+        "<label>Výrobce:</label><input type='text' name='vendor' placeholder='např. Toshiba' required>"
+        "<label>Funkce:</label><input type='text' name='function' placeholder='např. Power, TempUp' required>"
+        "<label>Ovladač (volitelné):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
+        "<div style='margin-top:10px;display:flex;gap:8px;justify-content:flex-end'>"
+          "<button type='button' class='btn' id='editCancel'>Zrušit</button>"
+          "<button type='submit' class='btn'>Uložit</button>"
+        "</div>"
+      "</form>"
+    "</div></div>"
     "<script>const data="
   );
   html += data;
   html += F(";"
     "const tb=document.getElementById('tb');"
+    "const modal=document.getElementById('editModal');"
+    "const form=document.getElementById('editForm');"
+    "const cancelBtn=document.getElementById('editCancel');"
+    "const idxInput=form.querySelector('input[name=index]');"
+    "function toHex(num){return '0x'+((num>>>0).toString(16).toUpperCase());}"
+    "function openEdit(idx,obj){"
+      "idxInput.value=idx;"
+      "form.proto.value=obj.proto||'UNKNOWN';"
+      "form.vendor.value=obj.vendor||'';"
+      "form.function.value=obj.function||'';"
+      "form.remote_label.value=obj.remote_label||'';"
+      "modal.style.display='flex';"
+    "}"
+    "cancelBtn.onclick=()=>{modal.style.display='none';};"
+    "modal.addEventListener('click',e=>{if(e.target===modal){modal.style.display='none';}});"
+    "form.onsubmit=async(e)=>{"
+      "e.preventDefault();"
+      "const fd=new FormData(form);"
+      "const params=new URLSearchParams(fd);"
+      "try{"
+        "const r=await fetch('/api/learn_update',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params});"
+        "const j=await r.json();"
+        "if(j.ok){alert('Uloženo.');modal.style.display='none';location.reload();}"
+        "else{alert('Uložení selhalo.');}"
+      "}catch(err){alert('Chyba připojení.');}"
+    "};"
     "data.forEach((o,i)=>{"
       "const tr=document.createElement('tr');"
-      "function td(t){const e=document.createElement('td');e.innerHTML=t;tr.appendChild(e);} "
-      "td(i+1); td(o.vendor||''); td(o.proto||'UNKNOWN'); td(o.function||''); td(o.remote_label||''); "
-      "td(o.bits||0); td('0x'+(o.addr>>>0).toString(16).toUpperCase()); "
-      "td('0x'+(o.value>>>0).toString(16).toUpperCase()); td(o.flags||0); "
+      "function addCell(text){const td=document.createElement('td');td.textContent=text;tr.appendChild(td);}"
+      "addCell(i+1);"
+      "addCell(o.vendor||'');"
+      "addCell(o.proto||'UNKNOWN');"
+      "addCell(o.function||'');"
+      "addCell(o.remote_label||'');"
+      "addCell(o.bits||0);"
+      "addCell(toHex(o.addr||0));"
+      "addCell(toHex(o.value||0));"
+      "addCell(o.flags||0);"
+      "const actionTd=document.createElement('td');"
+      "const btn=document.createElement('button');"
+      "btn.type='button';"
+      "btn.textContent='Upravit';"
+      "btn.className='btn';"
+      "btn.onclick=()=>openEdit(i,o);"
+      "actionTd.appendChild(btn);"
+      "tr.appendChild(actionTd);"
       "tb.appendChild(tr);"
     "});"
     "</script></body></html>"
@@ -763,6 +900,25 @@ void handleApiLearnSave() {
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
+void handleApiLearnUpdate() {
+  auto need = [&](const char* k){ return server.hasArg(k) && server.arg(k).length() > 0; };
+
+  if (!need("index") || !need("proto") || !need("vendor") || !need("function")) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing params\"}");
+    return;
+  }
+
+  size_t index = static_cast<size_t>(strtoul(server.arg("index").c_str(), nullptr, 10));
+  String proto  = server.arg("proto");        proto.trim();
+  String vendor = server.arg("vendor");       vendor.trim();
+  String func   = server.arg("function");     func.trim();
+  String remote = server.hasArg("remote_label") ? server.arg("remote_label") : "";
+  remote.trim();
+
+  bool ok = fsUpdateLearned(index, proto, vendor, func, remote);
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
 void startWebServer() {
   server.on("/", handleRoot);
   server.on("/settings", HTTP_POST, handleSettingsPost);
@@ -774,6 +930,7 @@ void startWebServer() {
   server.on("/api/history", handleJsonHistory);
   server.on("/api/learned", handleApiLearned);
   server.on("/api/learn_save", HTTP_POST, handleApiLearnSave); // NOVÉ
+  server.on("/api/learn_update", HTTP_POST, handleApiLearnUpdate);
 
   server.begin();
   Serial.println(F("[NET] WebServer běží na portu 80"));
