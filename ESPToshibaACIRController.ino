@@ -109,54 +109,117 @@ static void initIrSender(int8_t pin) {
 // === Mapování textového názvu protokolu na decode_type_t ===
 static decode_type_t parseProtoLabel(const String &s) {
   String u = s; u.trim(); u.toUpperCase();
-  if (u == "NEC" || u == "NEC2") return NEC;
+  if (u == "NEC" || u == "NEC1" || u == "NEC2") return NEC;
   if (u == "SONY") return SONY;
   if (u == "RC5") return RC5;
   if (u == "RC6") return RC6;
-  if (u == "SAMSUNG") return SAMSUNG;
+  if (u == "SAMSUNG" || u == "SAMSUNG32") return SAMSUNG;
   if (u == "JVC") return JVC;
   if (u == "LG") return LG;
   if (u == "PANASONIC") return PANASONIC;
-  if (u == "KASEIKYO") return KASEIKYO;
+  if (u == "KASEIKYO" || u == "PANASONIC_KASEIKYO") return KASEIKYO;
   if (u == "APPLE") return APPLE;
   if (u == "ONKYO") return ONKYO;
+  if (u == "TOSHIBA-AC" || u == "TOSHIBA") return NEC;
+  // explicitně UNKNOWN/"" -> UNKNOWN
   return UNKNOWN;
 }
 
+static bool findProtoInHistory(uint32_t value, uint8_t bits, uint32_t addr, decode_type_t &outProto) {
+  for (size_t i = 0; i < histCount; i++) {
+    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
+    const IREvent &e = history[idx];
+    if (e.value == value && e.bits == bits && e.address == addr && e.proto != UNKNOWN) {
+      outProto = e.proto;
+      return true;
+    }
+  }
+  return false;
+}
+
 // === Odeslání naučeného záznamu podle protokolu ===
+// ========== Odeslání naučeného kódu ==========
 static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
   decode_type_t p = parseProtoLabel(e.proto);
+
+  // Fallback: learned je UNKNOWN → zkusíme dohledat protokol v historii
+  if (p == UNKNOWN) {
+    decode_type_t histP = UNKNOWN;
+    if (findProtoInHistory(e.value, e.bits, e.addr, histP)) {
+      p = histP;
+      Serial.print(F("[IR-TX] Proto bylo UNKNOWN, beru z historie: "));
+      Serial.println((int)p);
+    }
+  }
+
+  // Diagnostika – uvidíš přesně co se snažíme posílat
+  Serial.print(F("[IR-TX] send proto="));
+  Serial.print((int)p);
+  Serial.print(F(" label='"));
+  Serial.print(e.proto);
+  Serial.print(F("' bits="));
+  Serial.print(e.bits);
+  Serial.print(F(" addr=0x"));
+  Serial.print(e.addr, HEX);
+  Serial.print(F(" value=0x"));
+  Serial.print(e.value, HEX);
+  Serial.print(F(" reps="));
+  Serial.println(repeats);
+
+  // Počet skutečných vyslání (pro ty, co nemají repeats parametr)
+  const uint8_t times = (uint8_t)min<int>(1 + repeats, 4);
+
   switch (p) {
     case NEC:
       IrSender.sendNEC((unsigned long)e.value, (int)e.bits, (int_fast8_t)repeats);
       return true;
+
     case SONY:
       IrSender.sendSony((unsigned long)e.value, (int)e.bits, (int_fast8_t)repeats);
       return true;
-    case RC5:
-      IrSender.sendRC5((unsigned long)e.value, (int)e.bits);
-      return true;
-    case RC6:
-      IrSender.sendRC6((unsigned long)e.value, (int)e.bits);
-      return true;
+
     case SAMSUNG:
       IrSender.sendSamsung((unsigned long)e.value, (int)e.bits, (int_fast8_t)repeats);
       return true;
+
     case JVC:
-      // varianta s daty má signaturu (unsigned long data, int nbits, bool repeat)
       IrSender.sendJVC((unsigned long)e.value, (int)e.bits, repeats > 0);
+      for (uint8_t i = 1; i < times; i++) { delay(20); IrSender.sendJVC((unsigned long)e.value, (int)e.bits, true); }
       return true;
+
     case LG:
-      IrSender.sendLG((unsigned long)e.value, (int)e.bits);
+      for (uint8_t i = 0; i < times; i++) { IrSender.sendLG((unsigned long)e.value, (int)e.bits); if (i+1<times) delay(40); }
       return true;
+
+    case RC5:
+      for (uint8_t i = 0; i < times; i++) { IrSender.sendRC5((unsigned long)e.value, (int)e.bits); if (i+1<times) delay(100); }
+      return true;
+
+    case RC6:
+      for (uint8_t i = 0; i < times; i++) { IrSender.sendRC6((unsigned long)e.value, (int)e.bits); if (i+1<times) delay(100); }
+      return true;
+
     case PANASONIC:
     case KASEIKYO:
-      // Panasonic/Kaseikyo: (address, data, nbits)
-      IrSender.sendPanasonic((unsigned int)e.addr, (unsigned long)e.value, (int)e.bits);
+      for (uint8_t i = 0; i < times; i++) { IrSender.sendPanasonic((unsigned int)e.addr, (unsigned long)e.value, (int)e.bits); if (i+1<times) delay(100); }
       return true;
+
+    case APPLE:
+    case ONKYO:
+      // často NEC-kompatibilní
+      IrSender.sendNEC((unsigned long)e.value, (int)e.bits, (int_fast8_t)repeats);
+      return true;
+
     default:
-      return false; // neznámý/nepodporovaný
+      Serial.println(F("[IR-TX] Nepodporovaný/neurčený protokol – nelze poslat."));
+      return false;
   }
+}
+
+static bool sendLearnedByIndex(int idx, uint8_t repeats) {
+  const LearnedCode* e = getLearnedByIndex((int16_t)idx);
+  if (!e) return false;
+  return irSendLearned(*e, repeats);
 }
 
 // ====== Pomocné ======
@@ -595,7 +658,11 @@ void handleRoot() {
       html += static_cast<uint32_t>(e.bits);    html += F(",");
       html += static_cast<uint32_t>(e.address); html += F(",");
       html += static_cast<uint32_t>(e.flags);   html += F(",");
-      html += F("'UNKNOWN'");
+      // ↓↓↓ pošli skutečný známý protokol (z learned, jinak z dekodéru)
+      html += '\'';
+      if (learned && learned->proto.length()) html += learned->proto;
+      else                                    html += String(protoName(e.proto));
+      html += F("'");
       html += F(")\">Učit</button>");
     } else if (learned) {
       html += F("<span class='muted'>");
@@ -919,7 +986,14 @@ void handleApiLearnSave() {
   uint32_t addr  = (uint32_t) strtoul(server.arg("addr").c_str(),   nullptr, 10);
   uint32_t flags = (uint32_t) strtoul(server.arg("flags").c_str(),  nullptr, 10);
 
-  String proto   = server.arg("proto");        proto.trim();
+  String proto = server.arg("proto"); proto.trim();
+  decode_type_t p = parseProtoLabel(proto);
+  if (p == UNKNOWN) {
+    // fallback: když nám poslali nepodporovaný text, vezmi, co skutečně detekoval dekodér naposledy
+    // (můžeš si sem předat IRData z historie; anebo jen odmítnout uložení s err)
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"unsupported proto label\"}");
+    return;
+  }
   String vendor  = server.arg("vendor");       vendor.trim();
   String func    = server.arg("function");     func.trim();
   String remote  = server.hasArg("remote_label") ? server.arg("remote_label") : "";
@@ -955,13 +1029,11 @@ static void handleApiSend() {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing index\"}");
     return;
   }
-  int idx = strtol(server.arg("index").c_str(), nullptr, 10);
-
+  const int idx = strtol(server.arg("index").c_str(), nullptr, 10);
   uint8_t reps = 0;
   if (server.hasArg("repeat")) {
     long r = strtol(server.arg("repeat").c_str(), nullptr, 10);
-    if (r < 0) r = 0; if (r > 3) r = 3;
-    reps = (uint8_t)r;
+    if (r < 0) r = 0; if (r > 3) r = 3; reps = (uint8_t)r;
   }
 
   const LearnedCode* e = getLearnedByIndex(idx);
@@ -970,11 +1042,16 @@ static void handleApiSend() {
     return;
   }
 
-  bool ok = irSendLearned(*e, reps);
-  const char* respOK  = "{\"ok\":true}";
-  const char* respNOK = "{\"ok\":false,\"err\":\"unsupported protocol\"}";
-  server.send(ok ? 200 : 501, "application/json", ok ? respOK : respNOK);
+  const bool ok = irSendLearned(*e, reps);
+  if (ok) { server.send(200, "application/json", "{\"ok\":true}"); return; }
+
+  // Rozlišíme UNKNOWN vs. neznámý text
+  String why = "unsupported protocol";
+  if (parseProtoLabel(e->proto) == UNKNOWN) why = "proto UNKNOWN or not mapped";
+  String resp = String("{\"ok\":false,\"err\":\"") + why + "\"}";
+  server.send(501, "application/json", resp);
 }
+
 
 // ====== Router a běh webu ======
 void startWebServer() {
