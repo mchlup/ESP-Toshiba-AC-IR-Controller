@@ -175,16 +175,17 @@ bool fsAppendLearned(uint32_t value,
   String line;
   line.reserve(320);
   line += '{';
-  line += "\"ts\":" + String((uint32_t)millis());
-  line += ",\"proto\":\"";      line += protoStr;      line += '"';
-  line += ",\"value\":" + String(value);
-  line += ",\"bits\":" + String(bits);
-  line += ",\"addr\":" + String(addr);
-  line += ",\"flags\":" + String(flags);
-  line += ",\"vendor\":\"";       line += jsonEscape(vendor);        line += '"';
-  line += ",\"function\":\"";     line += jsonEscape(functionName);  line += '"';
-  line += ",\"remote_label\":\""; line += jsonEscape(remoteLabel);   line += '"';
-  line += "}\n";
+  line += F("\"ts\":");         line += static_cast<uint32_t>(millis());
+  line += F(",\"proto\":\""); line += protoStr;                   line += '"';
+  line += F(",\"value\":");     line += value;
+  line += F(",\"bits\":");      line += static_cast<uint32_t>(bits);
+  line += F(",\"addr\":");      line += addr;
+  line += F(",\"flags\":");     line += flags;
+  line += F(",\"vendor\":\""); line += jsonEscape(vendor);        line += '"';
+  line += F(",\"function\":\""); line += jsonEscape(functionName);  line += '"';
+  line += F(",\"remote_label\":\"");
+  line += jsonEscape(remoteLabel);
+  line += F("\"}\n");
 
   size_t w = f.print(line);
   f.close();
@@ -237,7 +238,7 @@ void handleRoot() {
   html += F("<div class='muted'>IP: ");
   html += WiFi.localIP().toString();
   html += F(" &nbsp; | &nbsp; RSSI: ");
-  html += String(WiFi.RSSI());
+  html += WiFi.RSSI();
   html += F(" dBm</div>");
 
   // Ovládací lišta
@@ -260,19 +261,19 @@ void handleRoot() {
             "<th>addr</th><th>cmd</th><th>value</th><th>flags</th><th>Akce</th></tr></thead><tbody>");
 
   size_t shown = 0;
-    for (size_t i = 0; i < histCount; i++) {
+  for (size_t i = 0; i < histCount; i++) {
     size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
     const IREvent &e = history[idx];
     if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
 
     html += F("<tr><td>");
-    html += String(++shown);
+    html += ++shown;
     html += F("</td><td>");
-    html += String(e.ms);
+    html += e.ms;
     html += F("</td><td>");
-    html += String(String() + (const __FlashStringHelper*)protoName(e.proto));
+    html += protoName(e.proto);
     html += F("</td><td>");
-    html += String(e.bits);
+    html += static_cast<uint32_t>(e.bits);
     html += F("</td><td><code>0x");
     html += String(e.address, HEX);
     html += F("</code></td><td><code>0x");
@@ -280,15 +281,15 @@ void handleRoot() {
     html += F("</code></td><td><code>0x");
     html += String(e.value, HEX);
     html += F("</code></td><td>");
-    html += String(e.flags);
+    html += e.flags;
     html += F("</td><td>");   // === Akce ===
 
     if (e.proto == UNKNOWN) {
       html += F("<button class='btn' onclick=\"openLearn(");
-      html += String((uint32_t)e.value);   html += F(",");
-      html += String((uint32_t)e.bits);    html += F(",");
-      html += String((uint32_t)e.address); html += F(",");
-      html += String((uint32_t)e.flags);   html += F(",");
+      html += static_cast<uint32_t>(e.value);   html += F(",");
+      html += static_cast<uint32_t>(e.bits);    html += F(",");
+      html += static_cast<uint32_t>(e.address); html += F(",");
+      html += static_cast<uint32_t>(e.flags);   html += F(",");
       html += F("'UNKNOWN'");
       html += F(")\">Učit</button>");
     } else {
@@ -365,7 +366,7 @@ void handleJsonHistory() {
   out += F("{\"ip\":\"");
   out += WiFi.localIP().toString();
   out += F("\",\"rssi\":");
-  out += String(WiFi.RSSI());
+  out += WiFi.RSSI();
   out += F(",\"only_unknown\":");
   out += g_showOnlyUnknown ? "true" : "false";
   out += F(",\"history\":[");
@@ -375,14 +376,14 @@ void handleJsonHistory() {
     const IREvent &e = history[idx];
     if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
     if (!first) out += ',';
-    out += F("{\"ms\":"); out += String(e.ms);
+    out += F("{\"ms\":"); out += e.ms;
     out += F(",\"proto\":\"");
-    out += String(String() + (const __FlashStringHelper*)protoName(e.proto));
-    out += F("\",\"bits\":"); out += String(e.bits);
-    out += F(",\"addr\":"); out += String(e.address);
-    out += F(",\"cmd\":");  out += String(e.command);
-    out += F(",\"value\":");out += String(e.value);
-    out += F(",\"flags\":");out += String(e.flags);
+    out += protoName(e.proto);
+    out += F("\",\"bits\":"); out += static_cast<uint32_t>(e.bits);
+    out += F(",\"addr\":"); out += e.address;
+    out += F(",\"cmd\":");  out += e.command;
+    out += F(",\"value\":");out += e.value;
+    out += F(",\"flags\":");out += e.flags;
     out += F("}");
     first = false;
   }
@@ -414,11 +415,11 @@ void handleLearnPage() {
   }
 
   html += F("<p>Poslední UNKNOWN zachycený kód:</p><ul>");
-  html += F("<li>bits: ");   html += String(lastUnknown.bits);   html += F("</li>");
+  html += F("<li>bits: ");   html += static_cast<uint32_t>(lastUnknown.bits); html += F("</li>");
   html += F("<li>addr: <code>0x"); html += String(lastUnknown.address, HEX); html += F("</code></li>");
   html += F("<li>cmd:  <code>0x"); html += String(lastUnknown.command, HEX); html += F("</code></li>");
   html += F("<li>value:<code>0x"); html += String(lastUnknown.value, HEX);   html += F("</code></li>");
-  html += F("<li>flags: ");  html += String(lastUnknown.flags);  html += F("</li></ul>");
+  html += F("<li>flags: ");  html += lastUnknown.flags;                  html += F("</li></ul>");
 
   html += F(
     "<form method='POST' action='/learn_save'>"
@@ -553,6 +554,11 @@ void startWebServer() {
   Serial.println(F("[NET] WebServer běží na portu 80"));
 }
 
+inline void serviceClient() {
+  server.handleClient();
+  delay(1);
+}
+
 // ====== SETUP / LOOP ======
 void setup() {
   Serial.begin(115200);
@@ -586,8 +592,7 @@ void setup() {
 
 void loop() {
   if (!IrReceiver.decode()) {
-    server.handleClient();
-    delay(1);
+    serviceClient();
     return;
   }
 
@@ -596,8 +601,7 @@ void loop() {
   // Šum pryč
   if (isNoise(d)) {
     IrReceiver.resume();
-    server.handleClient();
-    delay(1);
+    serviceClient();
     return;
   }
 
@@ -639,6 +643,5 @@ void loop() {
   lastValue= d.decodedRawData;
 
   IrReceiver.resume();
-  server.handleClient();
-  delay(1);
+  serviceClient();
 }
