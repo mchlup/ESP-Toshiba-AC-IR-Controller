@@ -8,14 +8,15 @@
 #include <FS.h>
 #include <vector>
 
+struct LearnedCode;
+struct IREvent;
+
 String jsonEscape(const String& s);
 
 // ====== HW ======
 static const uint8_t IR_RX_PIN = 10;   // ESP32-C3: funguje i 4/5/10
-
 // ====== IR deduplikace ======
 static const uint32_t DUP_FILTER_MS = 120;
-
 // ====== Noise filtr (bez rawlen – kompatibilní s tvojí verzí) ======
 static bool isNoise(const IRData &d) {
   if (d.flags & IRDATA_FLAGS_WAS_OVERFLOW) return true;
@@ -33,6 +34,8 @@ WebServer server(80);
 
 // ====== NVS nastavení ======
 Preferences prefs;                 // namespace: "irrecv"
+// ====== LittleFS – “databáze” learned kódů (JSON Lines) ======
+static const char* LEARN_FILE = "/learned.jsonl";
 static bool g_showOnlyUnknown = false;
 
 // ====== Historie IR (ring buffer) ======
@@ -84,7 +87,7 @@ static bool isWhitespace(char c) {
 }
 
 static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out) {
-  String pattern = String('"') + key + String("":");
+  String pattern = String('"') + key + String("\":");
   int idx = line.indexOf(pattern);
   if (idx < 0) return false;
   idx += pattern.length();
@@ -108,7 +111,7 @@ static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out
 }
 
 static bool jsonExtractString(const String &line, const char *key, String &out) {
-  String pattern = String('"') + key + String("":"");
+  String pattern = String('"') + key + String("\":\"");
   int idx = line.indexOf(pattern);
   if (idx < 0) return false;
   idx += pattern.length();
@@ -352,7 +355,6 @@ void wifiSetupWithWiFiManager() {
 // ====== LittleFS – “databáze” learned kódů (JSON Lines) ======
 // Každá položka je jeden JSON řádek s klíči:
 //  ts, value, bits, addr, flags, vendor, proto_label, remote_label
-static const char* LEARN_FILE = "/learned.jsonl";
 
 // Uložení naučené položky – nyní s uložením názvu protokolu (proto) a "function" (název funkce tlačítka)
 bool fsAppendLearned(uint32_t value,
