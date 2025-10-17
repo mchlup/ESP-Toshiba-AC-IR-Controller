@@ -1,841 +1,644 @@
-// ESP-IR-Transceiver.ino
-// -----------------------------------------------------------------------------
-// IR transceiver for learning (capturing) and sending IR codes.
-// Built on the same base style as ESP-Toshiba-AC-Modbus: WiFiManager portal,
-// Web UI + REST API, MQTT (optional), OTA, LittleFS storage, basic Modbus (optional).
-//
-// Hardware (defaults for ESP8266 D1 mini / ESP-12F):
-//  - IR Receiver (TSOP38238 / VS1838B) -> GPIO5 (D1)
-//  - IR LED (through NPN/MOSFET driver recommended) -> GPIO4 (D2)
-//  - Status LED (built-in) -> GPIO2
-//  - FLASH button -> GPIO0
-//
-// Notes:
-//  - For "learning" arbitrary remotes reliably, use a demodulating IR receiver.
-//  - Raw capture is stored as microsecond timings and carrier frequency (kHz).
-//  - You can retransmit by ID over HTTP or MQTT. Files live in /codes/*.json
-//  - Modbus TCP is optional and minimal here; disable to save flash/ram.
-//
-// Dependencies (Library Manager):
-//   - tzapu/WiFiManager
-//   - bblanchon/ArduinoJson
-//   - me-no-dev/ESPAsyncTCP (NOT needed) -> We use synchronous ESP8266WebServer
-//   - IRremoteESP8266 by David Conran et al. (IMPORTANT)
-//   - emelianov/Modbus-ESP8266 (optional)
-//
-// Tested on: ESP8266 core 3.1.2. Should also compile for ESP32 (pins differ).
-// -----------------------------------------------------------------------------
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>     // tzapu/WiFiManager
+#include <IRremote.hpp>      // Armin Joachimsmeyer (IRremote.hpp)
+#include <Preferences.h>     // NVS (nastavení)
+#include <LittleFS.h>        // souborový systém pro "learned" databázi
+#include <FS.h>
 
-#if defined(ESP8266)
-  #include <ESP8266WiFi.h>
-  #include <ESP8266WebServer.h>
-  using WebSrv = ESP8266WebServer;
-  #include <LittleFS.h>
-  #define FSYS LittleFS
-#elif defined(ESP32)
-  #include <WiFi.h>
-  #include <WebServer.h>
-  using WebSrv = WebServer;
-  #include <FS.h>
-  #include <LittleFS.h>
-  #define FSYS LittleFS
-#else
-  #error "Unsupported platform (ESP8266 or ESP32 required)"
-#endif
+// ====== HW ======
+static const uint8_t IR_RX_PIN = 10;   // ESP32-C3: funguje i 4/5/10
 
-#include <WiFiManager.h>
-#include <ArduinoOTA.h>
-#include <ArduinoJson.h>
-#include <PubSubClient.h>
-#include <WiFiClient.h>
-#include <WiFiClientSecure.h>
+// ====== IR deduplikace ======
+static const uint32_t DUP_FILTER_MS = 120;
 
-// IRremoteESP8266
-#include <IRrecv.h>
-#include <IRsend.h>
-#include <IRutils.h>
-
-// Optional Modbus TCP (minimal demo)
-#define USE_MODBUS false
-#if USE_MODBUS
-  #if defined(ESP8266)
-    #include <ModbusIP_ESP8266.h>
-  #elif defined(ESP32)
-    #include <ModbusIP_ESP32.h>
-  #endif
-#endif
-
-#include <EEPROM.h>
-
-// ================== Pins & HW config ==================
-#if defined(ESP8266)
-// Default pins for ESP8266 (D1 mini):
-  #define IR_RECV_PIN   5   // D1
-  #define IR_SEND_PIN   4   // D2
-  #define STATUS_LED    2   // D4 (builtin, active LOW)
-  #define FLASH_BTN     0   // D3 (LOW = pressed)
-#elif defined(ESP32)
-  #define IR_RECV_PIN   26
-  #define IR_SEND_PIN   25
-  #define STATUS_LED    2
-  #define FLASH_BTN     0
-#endif
-
-// IR settings
-static const uint16_t IR_KHZ_DEFAULT = 38;     // Default carrier for raw send if none captured
-static const uint16_t CAPTURE_BUFFER  = 1024;  // Number of entries in capture buffer
-static const uint16_t CAPTURE_TIMEOUT = 50;    // Milliseconds. Increase for long remotes
-
-IRrecv irrecv(IR_RECV_PIN, CAPTURE_BUFFER, CAPTURE_TIMEOUT, true);
-IRsend irsend(IR_SEND_PIN);
-
-// Global decode buffer
-decode_results g_results;
-
-// ================== Networking & Services =============
-WebSrv server(80);
-WiFiClient netClient;
-PubSubClient mqtt(netClient);
-
-// Device config persisted to FS
-struct DeviceConfig {
-  char mqtt_host[64]    = "";
-  uint16_t mqtt_port    = 1883;
-  bool mqtt_tls         = false;
-  char mqtt_user[32]    = "";
-  char mqtt_pass[32]    = "";
-  char mqtt_base[64]    = "ir";
-  uint8_t log_level     = 1;  // 0=quiet,1=info,2=debug
-  uint16_t ota_port     = 8266;
-  uint16_t learn_timeout_ms = 10000; // auto-stop learn after 10s
-  uint8_t web_auth      = 0;  // 0=no auth, 1=basic auth
-  char web_user[16]     = "admin";
-  char web_pass[16]     = "admin";
-} cfg;
-
-String g_chipId;
-String g_hostname;
-
-// ================== Modbus (optional) =================
-#if USE_MODBUS
-ModbusIP mb;
-// Holding registers map (basic):
-//  0: Status (bitfield) [bit0=WiFi, bit1=MQTT, bit2=IRrecv enabled, bit3: hasLastCapture]
-//  1: Last capture length (timing count)
-//  2: Command: send code index (write N => send code with index N in list)
-//  3: Result code (0=ok, !=0 error)
-//  10..: reserved
-uint16_t mb_regs[32] = {0};
-#endif
-
-// ================== Helpers ===========================
-void ledSet(bool on) {
-#if defined(ESP8266)
-  digitalWrite(STATUS_LED, on ? LOW : HIGH);
-#else
-  digitalWrite(STATUS_LED, on ? HIGH : LOW);
-#endif
-}
-
-bool isButtonPressed() {
-#if defined(ESP8266)
-  pinMode(FLASH_BTN, INPUT_PULLUP);
-#else
-  pinMode(FLASH_BTN, INPUT_PULLUP);
-#endif
-  return digitalRead(FLASH_BTN) == LOW;
-}
-
-// Simple logging
-void logi(const String& s) { if (cfg.log_level >= 1) Serial.println(s); }
-void logd(const String& s) { if (cfg.log_level >= 2) Serial.println(s); }
-
-// Forward declarations for globals used in helpers
-extern volatile bool g_learn_active;
-
-// --- Status helpers -------------------------------------------------
-String macStr(const uint8_t* m) {
-  char b[18];
-  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0],m[1],m[2],m[3],m[4],m[5]);
-  return String(b);
-}
-
-// ================== FS & Config ========================
-static const char* CONFIG_PATH = "/config.json";
-static const char* CODES_DIR   = "/codes";
-
-bool saveConfig() {
-  DynamicJsonDocument doc(1024);
-  doc["mqtt_host"] = cfg.mqtt_host;
-  doc["mqtt_port"] = cfg.mqtt_port;
-  doc["mqtt_tls"]  = cfg.mqtt_tls;
-  doc["mqtt_user"] = cfg.mqtt_user;
-  doc["mqtt_pass"] = cfg.mqtt_pass;
-  doc["mqtt_base"] = cfg.mqtt_base;
-  doc["log_level"] = cfg.log_level;
-  doc["ota_port"]  = cfg.ota_port;
-  doc["learn_timeout_ms"] = cfg.learn_timeout_ms;
-  doc["web_auth"]  = cfg.web_auth;
-  doc["web_user"]  = cfg.web_user;
-  doc["web_pass"]  = cfg.web_pass;
-
-  File f = FSYS.open(CONFIG_PATH, "w");
-  if (!f) return false;
-  bool ok = (serializeJson(doc, f) > 0);
-  f.close();
-  return ok;
-}
-
-bool loadConfig() {
-  if (!FSYS.exists(CONFIG_PATH)) return saveConfig();
-  File f = FSYS.open(CONFIG_PATH, "r");
-  if (!f) return false;
-  DynamicJsonDocument doc(1024);
-  DeserializationError e = deserializeJson(doc, f);
-  f.close();
-  if (e) return false;
-  strlcpy(cfg.mqtt_host, doc["mqtt_host"] | "", sizeof(cfg.mqtt_host));
-  cfg.mqtt_port = doc["mqtt_port"] | 1883;
-  cfg.mqtt_tls  = doc["mqtt_tls"] | false;
-  strlcpy(cfg.mqtt_user, doc["mqtt_user"] | "", sizeof(cfg.mqtt_user));
-  strlcpy(cfg.mqtt_pass, doc["mqtt_pass"] | "", sizeof(cfg.mqtt_pass));
-  strlcpy(cfg.mqtt_base, doc["mqtt_base"] | "ir", sizeof(cfg.mqtt_base));
-  cfg.log_level = doc["log_level"] | 1;
-  cfg.ota_port  = doc["ota_port"] | 8266;
-  cfg.learn_timeout_ms = doc["learn_timeout_ms"] | 10000;
-  cfg.web_auth  = doc["web_auth"] | 0;
-  strlcpy(cfg.web_user, doc["web_user"] | "admin", sizeof(cfg.web_user));
-  strlcpy(cfg.web_pass, doc["web_pass"] | "admin", sizeof(cfg.web_pass));
-  return true;
-}
-
-// Unique name: IR-<chip>-GW
-String makeHostname() {
-#if defined(ESP8266)
-  uint32_t chip = ESP.getChipId();
-#elif defined(ESP32)
-  uint32_t chip = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
-#endif
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%06X", chip);
-  return String("IR-") + buf;
-}
-
-// =============== MQTT ===============================
-void mqttCallback(char* topic, byte* payload, unsigned int len);
-void mqttConnect() {
-  if (strlen(cfg.mqtt_host) == 0) return;
-  mqtt.setServer(cfg.mqtt_host, cfg.mqtt_port);
-  mqtt.setCallback(mqttCallback);
-  String cid = g_hostname + "-mqtt";
-  if (strlen(cfg.mqtt_user) > 0) {
-    mqtt.connect(cid.c_str(), cfg.mqtt_user, cfg.mqtt_pass);
-  } else {
-    mqtt.connect(cid.c_str());
+// ====== Noise filtr (bez rawlen – kompatibilní s tvojí verzí) ======
+static bool isNoise(const IRData &d) {
+  if (d.flags & IRDATA_FLAGS_WAS_OVERFLOW) return true;
+  if (d.protocol == UNKNOWN) {
+    if (d.numberOfBits == 0) return true;
+    if (d.decodedRawData == 0) return true;
   }
-  if (mqtt.connected()) {
-    String tcmd = String(cfg.mqtt_base) + "/" + g_chipId + "/cmd/#";
-    mqtt.subscribe(tcmd.c_str());
-    logi("[MQTT] Connected, subscribed: " + tcmd);
+  if (d.decodedRawData > 0 && d.decodedRawData < 0x100) return true; // přitvrdit klidně na 0x200
+  if (d.numberOfBits > 0 && d.numberOfBits < 8) return true;
+  return false;
+}
+
+// ====== Web server ======
+WebServer server(80);
+
+// ====== NVS nastavení ======
+Preferences prefs;                 // namespace: "irrecv"
+static bool g_showOnlyUnknown = false;
+
+// ====== Historie IR (ring buffer) ======
+struct IREvent {
+  uint32_t ms;
+  decode_type_t proto;
+  uint8_t bits;
+  uint32_t address;
+  uint16_t command;
+  uint32_t value;
+  uint32_t flags;
+};
+static const size_t HISTORY_LEN = 10;
+static IREvent history[HISTORY_LEN];
+static size_t histWrite = 0;
+static size_t histCount = 0;
+
+// Poslední validní UNKNOWN pro “Learn”
+static bool   hasLastUnknown = false;
+static IREvent lastUnknown = {0};
+
+// Stav pro dup filtr
+static uint32_t lastValue = 0;
+static decode_type_t lastProto = UNKNOWN;
+static uint8_t lastBits = 0;
+static uint32_t lastMs = 0;
+
+// ====== Pomocné ======
+const __FlashStringHelper* protoName(decode_type_t p) {
+  switch (p) {
+    case NEC: return F("NEC"); case NEC2: return F("NEC2"); case SONY: return F("SONY");
+    case RC5: return F("RC5"); case RC6: return F("RC6"); case PANASONIC: return F("PANASONIC");
+    case KASEIKYO: return F("KASEIKYO"); case SAMSUNG: return F("SAMSUNG"); case JVC: return F("JVC");
+    case LG: return F("LG"); case APPLE: return F("APPLE"); case ONKYO: return F("ONKYO");
+    default: return F("UNKNOWN");
   }
 }
 
-void mqttPublish(const String& subtopic, const String& payload, bool retain=false) {
-  if (!mqtt.connected()) return;
-  String t = String(cfg.mqtt_base) + "/" + g_chipId + "/" + subtopic;
-  mqtt.publish(t.c_str(), payload.c_str(), retain);
+void addToHistory(const IRData &d) {
+  IREvent e;
+  e.ms      = millis();
+  e.proto   = d.protocol;
+  e.bits    = d.numberOfBits;
+  e.address = d.address;
+  e.command = d.command;
+  e.value   = d.decodedRawData;
+  e.flags   = d.flags;
+
+  history[histWrite] = e;
+  histWrite = (histWrite + 1) % HISTORY_LEN;
+  if (histCount < HISTORY_LEN) histCount++;
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int len) {
-  String t = topic;
-  String msg;
-  msg.reserve(len+1);
-  for (unsigned int i=0;i<len;i++) msg += (char)payload[i];
-  logd("[MQTT] " + t + " = " + msg);
-
-  // Topics:
-  // <base>/<chip>/cmd/send_id -> {"id":"<file>"}
-  // <base>/<chip>/cmd/send_raw -> {"khz":38,"raw":[...us...]}
-  // <base>/<chip>/cmd/learn -> {"timeout":10000}
-  if (t.endsWith("/cmd/send_id")) {
-    DynamicJsonDocument doc(2048);
-    if (!deserializeJson(doc, msg)) {
-      String id = doc["id"] | "";
-      if (id.length()) {
-        bool ok = sendCodeById(id);
-        mqttPublish("result", ok ? "{\"ok\":true}" : "{\"ok\":false}", false);
-      }
-    }
-  } else if (t.endsWith("/cmd/send_raw")) {
-    DynamicJsonDocument doc(4096);
-    if (!deserializeJson(doc, msg)) {
-      uint16_t khz = doc["khz"] | IR_KHZ_DEFAULT;
-      JsonArray arr = doc["raw"].as<JsonArray>();
-      size_t n = arr.size();
-      if (n > 0 && n < 2000) {
-        std::unique_ptr<uint16_t[]> timings(new uint16_t[n]);
-        size_t i=0;
-        for (JsonVariant v : arr) timings[i++] = (uint16_t)(v.as<int>());
-        irsend.sendRaw(timings.get(), n, khz);
-        mqttPublish("result", "{\"ok\":true}", false);
-      }
-    }
-  } else if (t.endsWith("/cmd/learn")) {
-    startLearn(cfg.learn_timeout_ms);
-  }
-}
-
-// =============== IR Capture/Send =====================
-// --- Status helpers -------------------------------------------------
-uint32_t countCodesFiles() {
-  uint32_t cnt = 0;
-  File dir = FSYS.open("/codes", "r");   // <- nepoužívá CODES_DIR
-  if (dir && dir.isDirectory()) {
-    File f;
-    while ((f = dir.openNextFile())) {
-      if (!f.isDirectory() && String(f.name()).endsWith(".json")) cnt++;
-      f.close();
-    }
-  }
-  return cnt;
-}
-
-void printBootBanner() {
+void printLine(const IRData &d, bool isRepeatSuppressed) {
+  if (g_showOnlyUnknown && d.protocol != UNKNOWN) return; // nezahlcuj log, když filtr aktivní
+  Serial.print(F("[IR] "));
+  Serial.print(protoName(d.protocol));
+  Serial.print(F(" bits=")); Serial.print(d.numberOfBits);
+  Serial.print(F(" addr=0x")); Serial.print(d.address, HEX);
+  Serial.print(F(" cmd=0x")); Serial.print(d.command, HEX);
+  Serial.print(F(" value=0x")); Serial.print(d.decodedRawData, HEX);
+  if (d.flags & IRDATA_FLAGS_IS_REPEAT) Serial.print(F(" (REPEAT)"));
+  if (isRepeatSuppressed) Serial.print(F(" (suppressed)"));
   Serial.println();
-  Serial.println(F("============================================================"));
-  Serial.println(F("=                ESP IR Transceiver — BOOT                 ="));
-  Serial.println(F("============================================================"));
-
-#if defined(ESP8266)
-  Serial.printf_P(PSTR("[Chip] ESP8266 chipId=0x%06X core=%s\n"),
-                  ESP.getChipId(), ESP.getCoreVersion().c_str());
-  Serial.printf_P(PSTR("[CPU ] freq=%u MHz, freeHeap=%u B\n"),
-                  ESP.getCpuFreqMHz(), ESP.getFreeHeap());
-  // FS info (ESP8266)
-  FSInfo info; LittleFS.info(info);
-  Serial.printf("[FS  ] LittleFS mounted: %s\n", "yes"); // v setup už bylo FSYS.begin()
-  Serial.printf("[FS  ] total=%u B, used=%u B\n", info.totalBytes, info.usedBytes);
-#elif defined(ESP32)
-  uint64_t mac = ESP.getEfuseMac();
-  Serial.printf("[Chip] ESP32 efuseMAC=%04X%08X\n", (uint16_t)(mac>>32), (uint32_t)mac);
-  Serial.printf("[CPU ] freq=%u MHz, freeHeap=%u B\n", ESP.getCpuFreqMHz(), ESP.getFreeHeap());
-  // FS info (ESP32)
-  size_t total = FSYS.totalBytes();
-  size_t used  = FSYS.usedBytes();
-  Serial.printf("[FS  ] LittleFS mounted: %s\n", "yes");
-  Serial.printf("[FS  ] total=%u B, used=%u B\n", (unsigned)total, (unsigned)used);
-#endif
 }
 
-void printNetworkStatus(const char* prefix = "[NET ]") {
-  wl_status_t st = WiFi.status();
-  Serial.printf("%s mode=%s, status=%d\n", prefix,
-    (WiFi.getMode()==WIFI_STA?"STA":(WiFi.getMode()==WIFI_AP?"AP":(WiFi.getMode()==WIFI_AP_STA?"AP+STA":"OFF"))),
-    (int)st);
-
-  if (st == WL_CONNECTED) {
-    Serial.printf("%s SSID=%s, IP=%s, GW=%s, DNS=%s\n", prefix,
-      WiFi.SSID().c_str(),
-      WiFi.localIP().toString().c_str(),
-      WiFi.gatewayIP().toString().c_str(),
-      WiFi.dnsIP().toString().c_str());
-    Serial.printf("%s RSSI=%d dBm, BSSID=%s, Channel=%d\n", prefix,
-      WiFi.RSSI(),
-      WiFi.BSSIDstr().c_str(),
-      WiFi.channel());
-  }
+void printJSON(const IRData &d) {
+  if (g_showOnlyUnknown && d.protocol != UNKNOWN) return; // respektuj filtr i pro JSON log
+  Serial.print(F("{\"proto\":\""));
+  Serial.print(protoName(d.protocol));
+  Serial.print(F("\",\"bits\":"));
+  Serial.print(d.numberOfBits);
+  Serial.print(F(",\"addr\":"));
+  Serial.print(d.address);
+  Serial.print(F(",\"cmd\":"));
+  Serial.print(d.command);
+  Serial.print(F(",\"value\":"));
+  Serial.print((uint32_t)d.decodedRawData);
+  Serial.print(F(",\"flags\":"));
+  Serial.print((uint32_t)d.flags);
+  Serial.print(F(",\"ms\":"));
+  Serial.print(millis());
+  Serial.println(F("}"));
 }
 
-void printServiceStatus() {
-  Serial.printf("[HTTP] Web UI: http://%s/  or  http://%s/\n",
-                WiFi.localIP().toString().c_str(), g_hostname.c_str());
-  Serial.printf("[IR  ] learn_active=%s, codes=%lu\n",
-                g_learn_active ? "true" : "false", (unsigned long)countCodesFiles());
-  Serial.printf("[MQTT] host=%s, port=%u, connected=%s, base=%s/%s\n",
-                cfg.mqtt_host, cfg.mqtt_port,
-                mqtt.connected() ? "yes" : "no",
-                cfg.mqtt_base, g_chipId.c_str());
-}
-
-void printOneLineHeartbeat() {
-  Serial.printf("[HB ] IP=%s RSSI=%d MQTT=%s IR=%s codes=%lu Uptime=%lus\n",
-    WiFi.localIP().toString().c_str(),
-    WiFi.isConnected() ? WiFi.RSSI() : 0,
-    mqtt.connected() ? "on" : "off",
-    g_learn_active ? "learn" : "idle",
-    (unsigned long)countCodesFiles(),
-    (unsigned long)(millis()/1000UL));
-}
-
-volatile bool g_learn_active = false;
-uint32_t g_learn_deadline_ms = 0;
-String   g_last_id = "";
-uint16_t g_last_len = 0;
-
-String nowMsStr() { return String(millis()); }
-
-bool ensureCodesDir() {
-  if (!FSYS.exists(CODES_DIR)) return FSYS.mkdir(CODES_DIR);
-  return true;
-}
-
-// Generate file id: code-<millis>.json
-String makeCodeId() {
+// ====== Wi-Fi / WiFiManager ======
+String makeApName() {
+  uint8_t mac[6]; WiFi.macAddress(mac);
   char buf[32];
-  snprintf(buf, sizeof(buf), "code-%lu.json", (unsigned long)millis());
+  snprintf(buf, sizeof(buf), "IR-Receiver-Setup-%02X%02X", mac[4], mac[5]);
   return String(buf);
 }
 
-// Save captured result as JSON; returns file id
-// Save captured result as JSON; returns file id
-String saveCaptured(const decode_results& res) {
-  if (!ensureCodesDir()) return "";
-  String id = makeCodeId();
-  String path = String(CODES_DIR) + "/" + id;
-
-  DynamicJsonDocument doc(8192);
-  // Store meta & raw timing
-  doc["ts"] = millis();
-  doc["proto"] = typeToString(res.decode_type);
-  doc["bits"] = res.bits;
-  doc["address"] = res.address;
-  doc["command"] = res.command;
-  doc["repeat"] = res.repeat;
-
-  // POZOR: některé verze IRremoteESP8266 neposkytují res.frequency
-  // Uložíme default, odesílač při absenci použije IR_KHZ_DEFAULT.
-  doc["frequency"] = IR_KHZ_DEFAULT;
-
-  doc["rawlen"] = res.rawlen;
-
-  // Raw timing (microseconds) as array
-  JsonArray raw = doc.createNestedArray("raw");
-  for (uint16_t i = 1; i < res.rawlen; i++) { // skip first gap
-    raw.add(res.rawbuf[i] * kRawTick);        // kRawTick = 50us
+// Na začátek souboru přidej util funkci:
+String jsonEscape(const String& s) {
+  String o; o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') { o += "\\n"; }
+    else if (c == '\r') { o += "\\r"; }
+    else if (c == '\t') { o += "\\t"; }
+    else { o += c; }
   }
-
-  File f = FSYS.open(path, "w");
-  if (!f) return "";
-  bool ok = (serializeJson(doc, f) > 0);
-  f.close();
-  if (!ok) return "";
-  return id;
+  return o;
 }
 
-
-// Load code JSON and send
-bool sendCodeById(const String& id) {
-  String path = String(CODES_DIR) + "/" + id;
-  if (!FSYS.exists(path)) return false;
-  File f = FSYS.open(path, "r");
-  if (!f) return false;
-  DynamicJsonDocument doc(8192);
-  DeserializationError e = deserializeJson(doc, f);
-  f.close();
-  if (e) return false;
-  uint16_t khz = IR_KHZ_DEFAULT;
-if (doc.containsKey("frequency")) {
-  khz = (uint16_t)(doc["frequency"].as<int>());
-  if (khz == 0) khz = IR_KHZ_DEFAULT;
-}
-
-  JsonArray arr = doc["raw"].as<JsonArray>();
-  size_t n = arr.size();
-  if (n == 0 || n > 2000) return false;
-  std::unique_ptr<uint16_t[]> timings(new uint16_t[n]);
-  size_t i=0;
-  for (JsonVariant v : arr) timings[i++] = (uint16_t)(v.as<int>());
-  ledSet(true);
-  irsend.sendRaw(timings.get(), n, khz);
-  ledSet(false);
-  return true;
-}
-
-void startLearn(uint32_t timeout_ms) {
-  g_learn_active = true;
-  g_learn_deadline_ms = millis() + timeout_ms;
-  irrecv.enableIRIn();
-  logi("[IR] Learn started for " + String(timeout_ms) + " ms");
-}
-
-void stopLearn() {
-  g_learn_active = false;
-  irrecv.disableIRIn();
-  logi("[IR] Learn stopped");
-}
-
-// =============== Web UI/REST =========================
-bool checkAuth() {
-  if (cfg.web_auth == 0) return true;
-  if (!server.authenticate(cfg.web_user, cfg.web_pass)) {
-    server.requestAuthentication();
-    return false;
-  }
-  return true;
-}
-
-static const char APP_CSS[] PROGMEM = R"CSS(
-:root{--bg:#0b0f12;--fg:#e6e6e6;--muted:#8899a6;--card:#121820;--accent:#4da3ff}
-*{box-sizing:border-box}body{margin:0;font:14px/1.4 system-ui,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--fg)}
-.container{max-width:960px;margin:0 auto;padding:16px;display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-.card{background:var(--card);border-radius:16px;padding:16px;box-shadow:0 6px 20px rgba(0,0,0,.3);grid-column:span 12}
-h1,h2,h3{margin:.2em 0}h1{font-size:22px}.row{display:flex;gap:8px;flex-wrap:wrap}
-.btn{background:#1e2630;color:#fff;border:1px solid #2a3442;border-radius:10px;padding:8px 12px;cursor:pointer}
-.btn.primary{background:var(--accent);border-color:transparent;color:#001428}
-.input{background:#0d1319;border:1px solid #2a3442;color:#fff;border-radius:10px;padding:8px 10px}
-pre{white-space:pre-wrap;background:#0d1319;border:1px solid #2a3442;border-radius:10px;padding:8px}
-table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #223}
-.badge{display:inline-block;padding:2px 6px;border-radius:999px;background:#1f2833;color:#a7c7ff;border:1px solid #2a3442}
-.small{color:var(--muted);font-size:12px}
-)CSS";
-
-static const char APP_HTML[] PROGMEM = R"HTML(
-<!doctype html><html lang="cs"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP IR Transceiver</title><link rel="stylesheet" href="/app.css">
-</head><body><div class="container">
-  <div class="card"><h1>ESP IR Transceiver</h1>
-    <div class="row">
-      <button class="btn primary" onclick="learn()">Učit IR (10s)</button>
-      <button class="btn" onclick="refresh()">Obnovit seznam</button>
-    </div>
-    <div id="status" class="small"></div>
-  </div>
-  <div class="card">
-    <h3>Uložené IR kódy</h3>
-    <table id="codes"><thead><tr><th>ID</th><th>Protokol</th><th>Bits</th><th>Délka</th><th>Akce</th></tr></thead><tbody></tbody></table>
-  </div>
-  <div class="card">
-    <h3>Detail</h3>
-    <pre id="detail">(vyberte kód)</pre>
-  </div>
-</div>
-<script>
-async function learn(){
-  setStatus('Čekám na IR…'); 
-  const r = await fetch('/api/learn?timeout=10000'); 
-  const j = await r.json(); 
-  setStatus(JSON.stringify(j));
-  refresh();
-}
-function setStatus(s){document.getElementById('status').textContent=s}
-async function refresh(){
-  const r = await fetch('/api/codes'); const j = await r.json();
-  const tb = document.querySelector('#codes tbody'); tb.innerHTML='';
-  j.forEach(row=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td><span class="badge">${row.id}</span></td>
-      <td>${row.proto||'-'}</td><td>${row.bits||'-'}</td><td>${row.rawlen||'-'}</td>
-      <td class="row">
-        <button class="btn" onclick="send('${row.id}')">Odeslat</button>
-        <button class="btn" onclick="show('${row.id}')">Detail</button>
-        <button class="btn" onclick="del('${row.id}')">Smazat</button>
-      </td>`;
-    tb.appendChild(tr);
-  });
-}
-async function send(id){
-  const r = await fetch('/api/send?id='+encodeURIComponent(id)); const j = await r.json();
-  setStatus(JSON.stringify(j));
-}
-async function show(id){
-  const r = await fetch('/api/code?id='+encodeURIComponent(id)); const j = await r.json();
-  document.getElementById('detail').textContent = JSON.stringify(j,null,2);
-}
-async function del(id){
-  if(!confirm('Opravdu smazat '+id+'?')) return;
-  const r = await fetch('/api/delete?id='+encodeURIComponent(id)); const j = await r.json();
-  setStatus(JSON.stringify(j)); refresh();
-}
-refresh();
-</script>
-</body></html>
-)HTML";
-
-void handleRoot() {
-  if (!checkAuth()) return;
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/html; charset=utf-8", "");
-  WiFiClient client = server.client();
-  client.write_P(APP_HTML, strlen_P(APP_HTML));
-}
-
-void handleCss() {
-  if (!checkAuth()) return;
-  server.send_P(200, "text/css", APP_CSS);
-}
-
-void replyJSON(int code, const String& body) {
-  server.send(code, "application/json", body);
-}
-
-void handleLearn() {
-  if (!checkAuth()) return;
-  uint32_t timeout = server.hasArg("timeout") ? server.arg("timeout").toInt() : cfg.learn_timeout_ms;
-  startLearn(timeout);
-  replyJSON(200, "{\"ok\":true,\"timeout\":"+String(timeout)+"}");
-}
-
-void handleCodesList() {
-  if (!checkAuth()) return;
-  DynamicJsonDocument doc(4096);
-  JsonArray arr = doc.to<JsonArray>();
-  File dir = FSYS.open(CODES_DIR, "r");
-  if (dir && dir.isDirectory()) {
-    File f;
-    while ((f = dir.openNextFile())) {
-      if (!f.isDirectory()) {
-        String name = f.name();
-        if (name.endsWith(".json")) {
-          // Summaries
-          DynamicJsonDocument cdoc(1024);
-          DeserializationError e = deserializeJson(cdoc, f);
-          f.close();
-          if (!e) {
-            JsonObject o = arr.createNestedObject();
-            String id = String(name).substring(String(CODES_DIR).length()+1);
-            o["id"] = id;
-            o["proto"] = cdoc["proto"];
-            o["bits"] = cdoc["bits"];
-            o["rawlen"] = cdoc["rawlen"];
-          }
-        } else {
-          f.close();
-        }
-      } else {
-        f.close();
-      }
-    }
-  }
-  String out; serializeJson(arr, out);
-  replyJSON(200, out);
-}
-
-void handleCodeDetail() {
-  if (!checkAuth()) return;
-  String id = server.arg("id");
-  String path = String(CODES_DIR) + "/" + id;
-  if (!FSYS.exists(path)) return replyJSON(404, "{\"ok\":false,\"err\":\"notfound\"}");
-  File f = FSYS.open(path, "r");
-  if (!f) return replyJSON(500, "{\"ok\":false}");
-  server.streamFile(f, "application/json");
-  f.close();
-}
-
-void handleDelete() {
-  if (!checkAuth()) return;
-  String id = server.arg("id");
-  String path = String(CODES_DIR) + "/" + id;
-  if (!FSYS.exists(path)) return replyJSON(404, "{\"ok\":false}");
-  bool ok = FSYS.remove(path);
-  replyJSON(ok ? 200 : 500, ok ? "{\"ok\":true}" : "{\"ok\":false}");
-}
-
-void handleSendId() {
-  if (!checkAuth()) return;
-  String id = server.arg("id");
-  bool ok = sendCodeById(id);
-  replyJSON(ok ? 200 : 404, ok ? "{\"ok\":true}" : "{\"ok\":false}");
-}
-
-// =============== Setup & Loop =========================
-void setupWiFi() {
+void wifiSetupWithWiFiManager() {
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
-  wm.setClass("invert");
-  String apName = g_hostname + "-Setup";
-  wm.setConfigPortalBlocking(true);
-  wm.setTimeout(120);
-  bool res = wm.autoConnect(apName.c_str());
-  if (!res) {
-    // Start AP
-    wm.startConfigPortal(apName.c_str());
+  wm.setTitle("IR Receiver – WiFi Setup");
+  wm.setHostname("ir-receiver"); // pro mDNS by byl potřeba ještě MDNS.begin()
+
+  String apName = makeApName();
+  Serial.print(F("[NET] Připojuji Wi-Fi… "));
+  if (!wm.autoConnect(apName.c_str())) {
+    Serial.println(F("neúspěch, restartuji…"));
+    delay(1000);
+    ESP.restart();
   }
-  logi("[WiFi] IP: " + WiFi.localIP().toString());
-  printNetworkStatus();
-  Serial.printf("[NET ] Hostname=%s\n", g_hostname.c_str());
-  Serial.printf("[NET ] Web UI: http://%s/  or  http://%s/\n",
-                WiFi.localIP().toString().c_str(), g_hostname.c_str());
-
+  Serial.println(F("OK"));
+  Serial.print(F("[NET] IP: "));
+  Serial.println(WiFi.localIP());
 }
 
-void setupOTA() {
-  ArduinoOTA.setHostname(g_hostname.c_str());
-  ArduinoOTA.setPort(cfg.ota_port);
-  ArduinoOTA.onStart([](){
-    logi("[OTA] Start");
-  });
-  ArduinoOTA.onEnd([](){
-    logi("[OTA] End");
-  });
-  ArduinoOTA.onProgress([](unsigned int p, unsigned int t){
-    (void)p; (void)t;
-  });
-  ArduinoOTA.onError([](ota_error_t e){ Serial.printf("[OTA] Error %u\n", e); });
-  ArduinoOTA.begin();
+// ====== LittleFS – “databáze” learned kódů (JSON Lines) ======
+// Každá položka je jeden JSON řádek s klíči:
+//  ts, value, bits, addr, flags, vendor, proto_label, remote_label
+static const char* LEARN_FILE = "/learned.jsonl";
+
+// Uložení naučené položky – nyní s uložením názvu protokolu (proto) a "function" (název funkce tlačítka)
+bool fsAppendLearned(uint32_t value,
+                     uint8_t bits,
+                     uint32_t addr,
+                     uint32_t flags,
+                     const String &protoStr,     // NOVÉ: název protokolu (např. "UNKNOWN", "NEC", ...)
+                     const String &vendor,
+                     const String &functionName, // dříve "protoLabel" -> sémanticky lepší "function"
+                     const String &remoteLabel) {
+  File f = LittleFS.open(LEARN_FILE, FILE_APPEND);
+  if (!f) return false;
+
+  String line;
+  line.reserve(320);
+  line += '{';
+  line += "\"ts\":" + String((uint32_t)millis());
+  line += ",\"proto\":\"";      line += protoStr;      line += '"';
+  line += ",\"value\":" + String(value);
+  line += ",\"bits\":" + String(bits);
+  line += ",\"addr\":" + String(addr);
+  line += ",\"flags\":" + String(flags);
+  line += ",\"vendor\":\"";       line += jsonEscape(vendor);        line += '"';
+  line += ",\"function\":\"";     line += jsonEscape(functionName);  line += '"';
+  line += ",\"remote_label\":\""; line += jsonEscape(remoteLabel);   line += '"';
+  line += "}\n";
+
+  size_t w = f.print(line);
+  f.close();
+  return w == line.length();
 }
 
-void setupWeb() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/app.css", HTTP_GET, handleCss);
-  server.on("/api/learn", HTTP_GET, handleLearn);
-  server.on("/api/codes", HTTP_GET, handleCodesList);
-  server.on("/api/code", HTTP_GET, handleCodeDetail);
-  server.on("/api/send", HTTP_GET, handleSendId);
-  server.on("/api/delete", HTTP_GET, handleDelete);
-  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
-  server.begin();
-  logi("[HTTP] WebServer started");
+// Vrátí JSON array všech naučených kódů
+String fsReadLearnedAsArrayJSON() {
+  File f = LittleFS.open(LEARN_FILE, FILE_READ);
+  if (!f) return F("[]");
+  String out; out.reserve(2048);
+  out += '[';
+  bool first = true;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (!first) out += ',';
+    out += line;
+    first = false;
+  }
+  out += ']';
+  f.close();
+  return out;
 }
 
-void setupIR() {
-  irsend.begin();
-  irrecv.setUnknownThreshold(12); // Noise filter
-  irrecv.enableIRIn();            // For immediate readiness; will disable when not learning
+// ====== Web UI ======
+
+void handleRoot() {
+  String html;
+  html.reserve(9000);
+  html += F(
+    "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>IR Receiver – ESP32-C3</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
+    "h1{font-size:20px;margin:0 0 12px}"
+    ".muted{color:#666}"
+    "table{border-collapse:collapse;width:100%;max-width:980px}"
+    "th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}"
+    "th{background:#f5f5f5}"
+    "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    "a.btn,button.btn{display:inline-block;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa;text-decoration:none;color:#222}"
+    ".row{margin:8px 0}"
+    "</style></head><body>"
+  );
+  html += F("<h1>IR Receiver – ESP32-C3</h1>");
+
+  html += F("<div class='muted'>IP: ");
+  html += WiFi.localIP().toString();
+  html += F(" &nbsp; | &nbsp; RSSI: ");
+  html += String(WiFi.RSSI());
+  html += F(" dBm</div>");
+
+  // Ovládací lišta
+  html += F("<div class='row'>");
+  html += F("<form method='POST' action='/settings' style='display:inline'>");
+  html += F("<label><input type='checkbox' name='only_unk' value='1'");
+  if (g_showOnlyUnknown) html += F(" checked");
+  html += F("> Zobrazovat jen <b>UNKNOWN</b></label> ");
+  html += F("<button class='btn' type='submit'>Uložit</button>");
+  html += F("</form> &nbsp; ");
+  html += F("<a class='btn' href='/learn'>Učit kód</a> ");
+  html += F("<a class='btn' href='/learned'>Naučené kódy</a> ");
+  html += F("<a class='btn' href='/api/history'>API /history</a> ");
+  html += F("<a class='btn' href='/api/learned'>API /learned</a>");
+  html += F("</div>");
+
+  html += F("<h2 style='font-size:16px;margin:16px 0 8px'>Posledních 10 kódů</h2>");
+    html += F("<table><thead><tr>"
+            "<th>#</th><th>čas [ms]</th><th>protokol</th><th>bits</th>"
+            "<th>addr</th><th>cmd</th><th>value</th><th>flags</th><th>Akce</th></tr></thead><tbody>");
+
+  size_t shown = 0;
+    for (size_t i = 0; i < histCount; i++) {
+    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
+    const IREvent &e = history[idx];
+    if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
+
+    html += F("<tr><td>");
+    html += String(++shown);
+    html += F("</td><td>");
+    html += String(e.ms);
+    html += F("</td><td>");
+    html += String(String() + (const __FlashStringHelper*)protoName(e.proto));
+    html += F("</td><td>");
+    html += String(e.bits);
+    html += F("</td><td><code>0x");
+    html += String(e.address, HEX);
+    html += F("</code></td><td><code>0x");
+    html += String(e.command, HEX);
+    html += F("</code></td><td><code>0x");
+    html += String(e.value, HEX);
+    html += F("</code></td><td>");
+    html += String(e.flags);
+    html += F("</td><td>");   // === Akce ===
+
+    if (e.proto == UNKNOWN) {
+      html += F("<button class='btn' onclick=\"openLearn(");
+      html += String((uint32_t)e.value);   html += F(",");
+      html += String((uint32_t)e.bits);    html += F(",");
+      html += String((uint32_t)e.address); html += F(",");
+      html += String((uint32_t)e.flags);   html += F(",");
+      html += F("'UNKNOWN'");
+      html += F(")\">Učit</button>");
+    } else {
+      html += F("<span class='muted'>—</span>");
+    }
+
+    html += F("</td></tr>");
+  }
+
+  if (shown == 0) {
+    html += F("<tr><td colspan='9' class='muted'>Žádné položky k zobrazení…</td></tr>");
+  }
+  html += F("</tbody></table>");
+
+  html += F("<p class='muted' style='margin-top:12px'>Tip: S volbou „jen UNKNOWN“ snadno odfiltruješ známé protokoly a zaměříš se na učení.</p>");
+  // --- Modal a JS (inline) ---
+  html += F(
+    "<div id='learnModal' style='position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)'>"
+      "<div style='background:#fff;padding:16px 16px 12px;border-radius:10px;min-width:300px;max-width:90vw'>"
+        "<h3 style='margin:0 0 8px;font-size:16px'>Učit kód</h3>"
+        "<form id='learnForm'>"
+          "<input type='hidden' name='value'>"
+          "<input type='hidden' name='bits'>"
+          "<input type='hidden' name='addr'>"
+          "<input type='hidden' name='flags'>"
+          "<input type='hidden' name='proto'>"
+          "<label>Výrobce:</label><input type='text' name='vendor' placeholder='např. Toshiba' required>"
+          "<label>Funkce:</label><input type='text' name='function' placeholder='např. Power, TempUp' required>"
+          "<label>Ovladač (volitelné):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
+          "<div style='margin-top:10px;display:flex;gap:8px;justify-content:flex-end'>"
+            "<button type='button' class='btn' id='cancelBtn'>Zrušit</button>"
+            "<button type='submit' class='btn'>Uložit</button>"
+          "</div>"
+        "</form>"
+      "</div>"
+    "</div>"
+    "<script>"
+    "const modal=document.getElementById('learnModal');"
+    "const form=document.getElementById('learnForm');"
+    "const cancelBtn=document.getElementById('cancelBtn');"
+    "function openLearn(value,bits,addr,flags,proto){"
+      "form.value.value=value; form.bits.value=bits; form.addr.value=addr; form.flags.value=flags; form.proto.value=proto;"
+      "modal.style.display='flex';"
+    "}"
+    "cancelBtn.onclick=()=>{modal.style.display='none'};"
+    "form.onsubmit=async (e)=>{"
+      "e.preventDefault();"
+      "const fd=new FormData(form);"
+      "const params=new URLSearchParams(fd);"
+      "try{"
+        "const r=await fetch('/api/learn_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params});"
+        "const j=await r.json();"
+        "if(j.ok){ alert('Uloženo.'); modal.style.display='none'; location.reload(); }"
+        "else{ alert('Uložení selhalo.'); }"
+      "}catch(err){ alert('Chyba připojení.'); }"
+    "}"
+    "</script>"
+  );
+  html += F("</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
-void setupModbus() {
-#if USE_MODBUS
-  mb.server();
-  mb.addHreg(0, 0, 32); // allocate 32 registers
-#endif
+void handleSettingsPost() {
+  bool only = (server.hasArg("only_unk") && server.arg("only_unk") == "1");
+  g_showOnlyUnknown = only;
+  prefs.putBool("only_unk", g_showOnlyUnknown);
+  server.sendHeader("Location", "/");
+  server.send(302);
 }
 
-// Capture loop
-void processLearn() {
-  if (!g_learn_active) return;
-  if (millis() > g_learn_deadline_ms) {
-    stopLearn();
-    mqttPublish("learn", "{\"ok\":false,\"reason\":\"timeout\"}", false);
+void handleJsonHistory() {
+  // Vrací historii s ohledem na filtr g_showOnlyUnknown
+  String out; out.reserve(2048);
+  out += F("{\"ip\":\"");
+  out += WiFi.localIP().toString();
+  out += F("\",\"rssi\":");
+  out += String(WiFi.RSSI());
+  out += F(",\"only_unknown\":");
+  out += g_showOnlyUnknown ? "true" : "false";
+  out += F(",\"history\":[");
+  bool first = true;
+  for (size_t i = 0; i < histCount; i++) {
+    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
+    const IREvent &e = history[idx];
+    if (g_showOnlyUnknown && e.proto != UNKNOWN) continue;
+    if (!first) out += ',';
+    out += F("{\"ms\":"); out += String(e.ms);
+    out += F(",\"proto\":\"");
+    out += String(String() + (const __FlashStringHelper*)protoName(e.proto));
+    out += F("\",\"bits\":"); out += String(e.bits);
+    out += F(",\"addr\":"); out += String(e.address);
+    out += F(",\"cmd\":");  out += String(e.command);
+    out += F(",\"value\":");out += String(e.value);
+    out += F(",\"flags\":");out += String(e.flags);
+    out += F("}");
+    first = false;
+  }
+  out += F("]}");
+  server.send(200, "application/json", out);
+}
+
+void handleLearnPage() {
+  String html; html.reserve(4000);
+  html += F(
+    "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Učení kódu (UNKNOWN)</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
+    "label{display:block;margin:6px 0 2px}"
+    "input[type=text]{width:100%;max-width:420px;padding:6px 8px}"
+    "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    "button{padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa}"
+    ".muted{color:#666}"
+    "</style></head><body>"
+    "<h1>Učení kódu (UNKNOWN)</h1>"
+  );
+  if (!hasLastUnknown) {
+    html += F("<p class='muted'>Zatím nebyl zachycen žádný validní kód typu <b>UNKNOWN</b>. "
+              "Vrať se na <a href='/'>hlavní stránku</a> a zkuste odeslat IR z ovladače.</p></body></html>");
+    server.send(200, "text/html; charset=utf-8", html);
     return;
   }
-  if (irrecv.decode(&g_results)) {
-    ledSet(true);
-    String id = saveCaptured(g_results);
-    ledSet(false);
-    if (id.length()) {
-      g_last_id = id;
-      g_last_len = g_results.rawlen;
-      // publish summary
-      DynamicJsonDocument doc(1024);
-      doc["ok"] = true;
-      doc["id"] = id;
-      doc["proto"] = typeToString(g_results.decode_type);
-      doc["bits"] = g_results.bits;
-      String out; serializeJson(doc, out);
-      mqttPublish("learn", out, false);
-      logi("[IR] Saved " + id);
-#if USE_MODBUS
-      mb_regs[1] = g_last_len;
-      mb_regs[0] |= (1 << 3); // hasLastCapture
-#endif
-    } else {
-      mqttPublish("learn", "{\"ok\":false,\"reason\":\"save_failed\"}", false);
-    }
-    stopLearn();
-    irrecv.resume();
+
+  html += F("<p>Poslední UNKNOWN zachycený kód:</p><ul>");
+  html += F("<li>bits: ");   html += String(lastUnknown.bits);   html += F("</li>");
+  html += F("<li>addr: <code>0x"); html += String(lastUnknown.address, HEX); html += F("</code></li>");
+  html += F("<li>cmd:  <code>0x"); html += String(lastUnknown.command, HEX); html += F("</code></li>");
+  html += F("<li>value:<code>0x"); html += String(lastUnknown.value, HEX);   html += F("</code></li>");
+  html += F("<li>flags: ");  html += String(lastUnknown.flags);  html += F("</li></ul>");
+
+  html += F(
+    "<form method='POST' action='/learn_save'>"
+    "<label>Výrobce zařízení (vendor):</label>"
+    "<input type='text' name='vendor' placeholder='např. Toshiba' required>"
+    "<label>Označení protokolu (label):</label>"
+    "<input type='text' name='proto_label' placeholder='např. Toshiba-IR-RAW' required>"
+    "<label>Označení ovladače / zařízení:</label>"
+    "<input type='text' name='remote_label' placeholder='např. Klima Obývák' required>"
+    "<div style='margin-top:10px'><button type='submit'>Uložit do naučených</button></div>"
+    "</form>"
+    "<p class='muted' style='margin-top:10px'>Pozn.: ukládá se aktuálně poslední zachycený UNKNOWN kód.</p>"
+    "<p><a href='/'>← Zpět</a> &nbsp; <a href='/learned'>Naučené kódy</a></p>"
+    "</body></html>"
+  );
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleLearnSave() {
+  if (!hasLastUnknown) { server.sendHeader("Location", "/learn"); server.send(302); return; }
+
+  String vendor      = server.hasArg("vendor") ? server.arg("vendor") : "";
+  String protoLabel  = server.hasArg("proto_label") ? server.arg("proto_label") : "";
+  String remoteLabel = server.hasArg("remote_label") ? server.arg("remote_label") : "";
+
+  vendor.trim(); protoLabel.trim(); remoteLabel.trim();
+
+  bool ok = (vendor.length() && protoLabel.length() && remoteLabel.length()) &&
+          fsAppendLearned(lastUnknown.value,
+                          lastUnknown.bits,
+                          lastUnknown.address,
+                          lastUnknown.flags,
+                          String("UNKNOWN"),   // proto pro stránku Učení
+                          vendor,
+                          protoLabel,          // použijeme jako "function"
+                          remoteLabel);
+
+  String html; html.reserve(1200);
+  html += F("<!doctype html><html><meta charset='utf-8'><title>Uloženo</title><body>");
+  if (ok) {
+    html += F("<p>✅ Kód uložen.</p>");
+  } else {
+    html += F("<p>❌ Uložení selhalo.</p>");
   }
+  html += F("<p><a href='/learn'>← Zpět na učení</a> &nbsp; <a href='/learned'>Naučené kódy</a> &nbsp; <a href='/'>Domů</a></p>");
+  html += F("</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
-// =============== Setup =================================
+void handleLearnedList() {
+  // jednoduchý výpis z JSONL jako tabulka
+  String data = fsReadLearnedAsArrayJSON();
+  // Sestav HTML s minimálním parserem na straně klienta (JS) – jednodušší
+  String html; html.reserve(4000);
+  html += F(
+    "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Naučené kódy</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
+    "table{border-collapse:collapse;width:100%;max-width:980px}"
+    "th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}"
+    "th{background:#f5f5f5}"
+    "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    "</style></head><body>"
+    "<h1>Naučené kódy</h1>"
+    "<table><thead><tr>"
+    "<th>#</th><th>vendor</th><th>proto</th><th>function</th><th>remote_label</th>"
+    "<th>bits</th><th>addr</th><th>value</th><th>flags</th>"
+    "</tr></thead><tbody id='tb'></tbody></table>"
+    "<p><a href='/'>← Domů</a></p>"
+    "<script>const data="
+  );
+  html += data;
+  html += F(";"
+    "const tb=document.getElementById('tb');"
+    "data.forEach((o,i)=>{"
+      "const tr=document.createElement('tr');"
+      "function td(t){const e=document.createElement('td');e.innerHTML=t;tr.appendChild(e);} "
+      "td(i+1); td(o.vendor||''); td(o.proto||'UNKNOWN'); td(o.function||''); td(o.remote_label||''); "
+      "td(o.bits||0); td('0x'+(o.addr>>>0).toString(16).toUpperCase()); "
+      "td('0x'+(o.value>>>0).toString(16).toUpperCase()); td(o.flags||0); "
+      "tb.appendChild(tr);"
+    "});"
+    "</script></body></html>"
+  );
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleApiLearned() {
+  server.send(200, "application/json", fsReadLearnedAsArrayJSON());
+}
+
+// Přímé uložení z hlavní stránky (POST application/x-www-form-urlencoded)
+// očekává parametry: value,bits,addr,flags,proto,vendor,function,remote_label
+void handleApiLearnSave() {
+  auto need = [&](const char* k){ return server.hasArg(k) && server.arg(k).length() > 0; };
+
+  if (!(need("value") && need("bits") && need("addr") && need("flags") && need("proto") && need("vendor") && need("function"))) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing params\"}");
+    return;
+  }
+
+  uint32_t value = (uint32_t) strtoul(server.arg("value").c_str(),  nullptr, 10);
+  uint8_t  bits  = (uint8_t)  strtoul(server.arg("bits").c_str(),   nullptr, 10);
+  uint32_t addr  = (uint32_t) strtoul(server.arg("addr").c_str(),   nullptr, 10);
+  uint32_t flags = (uint32_t) strtoul(server.arg("flags").c_str(),  nullptr, 10);
+
+  String proto   = server.arg("proto");        proto.trim();
+  String vendor  = server.arg("vendor");       vendor.trim();
+  String func    = server.arg("function");     func.trim();
+  String remote  = server.hasArg("remote_label") ? server.arg("remote_label") : "";
+  remote.trim();
+
+  bool ok = fsAppendLearned(value, bits, addr, flags, proto, vendor, func, remote);
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+void startWebServer() {
+  server.on("/", handleRoot);
+  server.on("/settings", HTTP_POST, handleSettingsPost);
+
+  server.on("/learn", handleLearnPage);
+  server.on("/learn_save", HTTP_POST, handleLearnSave);
+  server.on("/learned", handleLearnedList);
+
+  server.on("/api/history", handleJsonHistory);
+  server.on("/api/learned", handleApiLearned);
+  server.on("/api/learn_save", HTTP_POST, handleApiLearnSave); // NOVÉ
+
+  server.begin();
+  Serial.println(F("[NET] WebServer běží na portu 80"));
+}
+
+// ====== SETUP / LOOP ======
 void setup() {
-  pinMode(STATUS_LED, OUTPUT);
-  ledSet(false);
   Serial.begin(115200);
-  delay(10);
-#if defined(ESP8266)
-  FSYS.begin();
-#elif defined(ESP32)
-  FSYS.begin(true);
-#endif
+  delay(200);
 
-  loadConfig();
-  g_hostname = makeHostname();
-  printBootBanner();
-#if defined(ESP8266)
-  g_chipId = String(ESP.getChipId(), HEX);
-#else
-  g_chipId = String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFF), HEX);
-#endif
+  Serial.println();
+  Serial.println(F("=== IR Receiver (IRremote) – ESP32-C3 ==="));
+  Serial.print(F("IR pin: ")); Serial.println(IR_RX_PIN);
 
-  setupWiFi();
-  setupOTA();
-  setupWeb();
-  setupIR();
-#if USE_MODBUS
-  setupModbus();
-#endif
+  // FS (pro naučené kódy)
+  if (!LittleFS.begin(true)) {
+    Serial.println(F("[FS] LittleFS mount selhal (format=true), pokračuji bez uložení learned."));
+  }
 
-  mqttConnect();
-  ledSet(false);
-    // Finální sumarizace po startu služeb
-  printNetworkStatus();
-  printServiceStatus();
+  // NVS (pro nastavení)
+  prefs.begin("irrecv", false);
+  g_showOnlyUnknown = prefs.getBool("only_unk", false);
+
+  // Wi-Fi přes WiFiManager (otevřený AP bez hesla při prvním nastavení)
+  wifiSetupWithWiFiManager();
+
+  startWebServer();
+
+  // IR přijímač
+  IrReceiver.begin(IR_RX_PIN, DISABLE_LED_FEEDBACK);
+
+  Serial.print(F("Protokoly povoleny: "));
+  IrReceiver.printActiveIRProtocols(&Serial);
+  Serial.println();
 }
-
-// =============== Loop ==================================
-uint32_t lastMqttMs = 0;
-uint32_t lastStateMs = 0;
 
 void loop() {
-  ArduinoOTA.handle();
+  if (!IrReceiver.decode()) {
+    server.handleClient();
+    delay(1);
+    return;
+  }
+
+  IRData &d = IrReceiver.decodedIRData;
+
+  // Šum pryč
+  if (isNoise(d)) {
+    IrReceiver.resume();
+    server.handleClient();
+    delay(1);
+    return;
+  }
+
+  // Deduplikace (repeat)
+  const uint32_t now = millis();
+  bool suppress = false;
+  if (d.flags & IRDATA_FLAGS_IS_REPEAT) {
+    if (now - lastMs < DUP_FILTER_MS &&
+        d.protocol == lastProto &&
+        d.numberOfBits == lastBits &&
+        d.decodedRawData == lastValue) {
+      suppress = true;
+    }
+  }
+
+  // Pokud chceme učit UNKNOWN, ulož poslední zachycený UNKNOWN (ne-suppressnutý)
+  if (d.protocol == UNKNOWN && !suppress) {
+    hasLastUnknown = true;
+    lastUnknown.ms      = now;
+    lastUnknown.proto   = UNKNOWN;
+    lastUnknown.bits    = d.numberOfBits;
+    lastUnknown.address = d.address;
+    lastUnknown.command = d.command;
+    lastUnknown.value   = d.decodedRawData;
+    lastUnknown.flags   = d.flags;
+  }
+
+  // Log + historie (respektuj filtr v print funkcích; do historie ukládáme vždy “nesuppressnuté”)
+  printLine(d, suppress);
+  if (!suppress) {
+    printJSON(d);
+    addToHistory(d);
+  }
+
+  // update dup stav
+  lastMs   = now;
+  lastProto= d.protocol;
+  lastBits = d.numberOfBits;
+  lastValue= d.decodedRawData;
+
+  IrReceiver.resume();
   server.handleClient();
-  processLearn();
-
-  if (!mqtt.connected()) {
-    static uint32_t nextTry = 0;
-    if (millis() > nextTry) {
-      mqttConnect();
-      nextTry = millis() + 5000;
-    }
-  } else {
-    mqtt.loop();
-  }
-
-    static uint32_t lastHb = 0;
-  if (millis() - lastHb > 30000UL) {  // 30 s
-    printOneLineHeartbeat();
-    lastHb = millis();
-  }
-
-  #if USE_MODBUS
-  // Update status bits
-  uint16_t st = 0;
-  if (WiFi.isConnected()) st |= 1;
-  if (mqtt.connected()) st |= (1 << 1);
-  if (irrecv.isIdle() == false) st |= (1 << 2); // learning
-  mb_regs[0] = st;
-  // Process Modbus
-  mb.task();
-  // Command: send code by index (write to Hreg2)
-  static uint16_t lastCmd = 0;
-  uint16_t cmd = mb.Hreg(2);
-  if (cmd != lastCmd) {
-    lastCmd = cmd;
-    // map index to file listing order
-    // For simplicity, send by enumerating directory and selecting Nth.
-    uint16_t i = 0;
-    String selected;
-    File dir = FSYS.open(CODES_DIR, "r");
-    if (dir && dir.isDirectory()) {
-      File f;
-      while ((f = dir.openNextFile())) {
-        if (!f.isDirectory()) {
-          String name = f.name();
-          f.close();
-          if (name.endsWith(".json")) {
-            if (i == cmd) { selected = String(name).substring(String(CODES_DIR).length()+1); break; }
-            i++;
-          }
-        } else f.close();
-      }
-    }
-    if (selected.length()) {
-      bool ok = sendCodeById(selected);
-      mb_regs[3] = ok ? 0 : 2;
-    } else {
-      mb_regs[3] = 1; // not found
-    }
-  }
-#endif
+  delay(1);
 }
