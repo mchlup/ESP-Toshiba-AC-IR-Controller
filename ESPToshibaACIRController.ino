@@ -76,6 +76,16 @@ static size_t histCount = 0;
 static std::vector<uint16_t> g_lastRaw;
 static uint8_t  g_lastRawKhz = 38;   // default
 static bool     g_lastRawValid = false;
+static uint32_t g_lastRawCaptureMs = 0;
+static String   g_lastRawSource = F("(none)");
+
+static bool     g_lastSendValid = false;
+static bool     g_lastSendOk = false;
+static uint32_t g_lastSendMs = 0;
+static String   g_lastSendMethod = F("none");
+static decode_type_t g_lastSendProto = UNKNOWN;
+static size_t   g_lastSendPulses = 0;
+static uint8_t  g_lastSendFreq = 0;
 
 // Soubor pro RAW: /learned/raw_<index>.bin  (binárně: [1B khz][2B len LE][2B*len pulzy])
 static String rawPathForIndex(size_t index) {
@@ -231,9 +241,23 @@ static void rawSnifferService() {
       // Bez měření nosné – zůstaneme u 38 kHz (většina spotřební elektroniky)
       g_lastRawKhz = 38;
       g_lastRawValid = !g_lastRaw.empty();
+      g_lastRawCaptureMs = millis();
+      g_lastRawSource = F("sniffer");
       g_isrFrameReady = true;  // jen pro debug; další hrana to zruší
     }
   }
+}
+
+static void recordSendDiagnostics(bool ok, const String &method,
+                                  decode_type_t proto, size_t pulses,
+                                  uint8_t freqKhz) {
+  g_lastSendValid = true;
+  g_lastSendOk = ok;
+  g_lastSendMs = millis();
+  g_lastSendMethod = method;
+  g_lastSendProto = proto;
+  g_lastSendPulses = pulses;
+  g_lastSendFreq = freqKhz;
 }
 
 // ======================== Deklarace funkcí ========================
@@ -270,6 +294,12 @@ static bool fsReadLearnedRawByValue(uint32_t value, uint8_t bits, uint32_t addr,
 
 // Odesílání
 static bool irSendLearned(const LearnedCode &e, uint8_t repeats);
+static bool irSendLastRaw(uint8_t repeats);
+static void recordSendDiagnostics(bool ok, const String &method,
+                                  decode_type_t proto, size_t pulses,
+                                  uint8_t freqKhz);
+String buildDiagnosticsJson();
+String buildRawDumpJson();
 
 // Web
 void startWebServer();
@@ -347,17 +377,45 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
 
   // 1) nativní protokoly (když je známý label)
   switch (t) {
-    case NEC:       return doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, (int)e.bits); });
-    case SONY:      return doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); });
-    case RC5:       return doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, (int)e.bits); });
-    case RC6:       return doRepeats([&]{ IrSender.sendRC6((unsigned long)e.value, (int)e.bits); });
-    case JVC:       return doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, (int)e.bits, false); });
-    case LG:        return doRepeats([&]{ IrSender.sendLG((unsigned long)e.value, (int)e.bits); });
-    case SAMSUNG:   { uint16_t a=(e.addr)?(uint16_t)e.addr:(uint16_t)(e.value>>16);
-                      uint16_t c=(uint16_t)(e.value & 0xFFFF);
-                      return doRepeats([&]{ IrSender.sendSamsung(a,c,0); }); }
-    case PANASONIC: return doRepeats([&]{ IrSender.sendPanasonic((uint16_t)e.addr, (uint32_t)e.value, 0); });
-    case SHARP:     return doRepeats([&]{ IrSender.sendSharp((uint16_t)e.addr, (uint16_t)(e.value&0xFFFF), 0); });
+    case NEC:
+      doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, (int)e.bits); });
+      recordSendDiagnostics(true, F("proto-NEC"), t, 0, 0);
+      return true;
+    case SONY:
+      doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); });
+      recordSendDiagnostics(true, F("proto-SONY"), t, 0, 0);
+      return true;
+    case RC5:
+      doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, (int)e.bits); });
+      recordSendDiagnostics(true, F("proto-RC5"), t, 0, 0);
+      return true;
+    case RC6:
+      doRepeats([&]{ IrSender.sendRC6((unsigned long)e.value, (int)e.bits); });
+      recordSendDiagnostics(true, F("proto-RC6"), t, 0, 0);
+      return true;
+    case JVC:
+      doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, (int)e.bits, false); });
+      recordSendDiagnostics(true, F("proto-JVC"), t, 0, 0);
+      return true;
+    case LG:
+      doRepeats([&]{ IrSender.sendLG((unsigned long)e.value, (int)e.bits); });
+      recordSendDiagnostics(true, F("proto-LG"), t, 0, 0);
+      return true;
+    case SAMSUNG: {
+      uint16_t a=(e.addr)?(uint16_t)e.addr:(uint16_t)(e.value>>16);
+      uint16_t c=(uint16_t)(e.value & 0xFFFF);
+      doRepeats([&]{ IrSender.sendSamsung(a,c,0); });
+      recordSendDiagnostics(true, F("proto-SAMSUNG"), t, 0, 0);
+      return true;
+    }
+    case PANASONIC:
+      doRepeats([&]{ IrSender.sendPanasonic((uint16_t)e.addr, (uint32_t)e.value, 0); });
+      recordSendDiagnostics(true, F("proto-PANASONIC"), t, 0, 0);
+      return true;
+    case SHARP:
+      doRepeats([&]{ IrSender.sendSharp((uint16_t)e.addr, (uint16_t)(e.value&0xFFFF), 0); });
+      recordSendDiagnostics(true, F("proto-SHARP"), t, 0, 0);
+      return true;
     default: break;
   }
 
@@ -365,6 +423,11 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
   if (rawOpt && !rawOpt->empty()) {
     IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz);
     for (uint8_t r=0; r<repeats; r++){ delay(60); IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz); }
+    if (rawOpt == &g_lastRaw) {
+      recordSendDiagnostics(true, F("raw-capture"), t, rawOpt->size(), rawKhz);
+    } else {
+      recordSendDiagnostics(true, F("raw-storage"), t, rawOpt->size(), rawKhz);
+    }
     return true;
   }
 
@@ -372,35 +435,54 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
 switch (e.bits) {
   case 32:
     // 32 b je nejčastěji NEC – zkus jen NEC (ať se přijímač zbytečně nechytačí na ONKYO/Kaseikyo)
-    if (doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, 32); })) return true;
+    if (doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, 32); })) {
+      recordSendDiagnostics(true, F("fallback-NEC"), NEC, 0, 0);
+      return true;
+    }
 
     // volitelně Samsung jen pokud máme aspoň něco v addr/cmd (jinak to často „přepřekládá“ na ONKYO)
     if (e.addr || (e.value & 0xFFFF)) {
       uint16_t a = e.addr ? (uint16_t)e.addr : (uint16_t)(e.value >> 16);
       uint16_t c = (uint16_t)(e.value & 0xFFFF);
-      if (doRepeats([&]{ IrSender.sendSamsung(a, c, 0); })) return true;
+      if (doRepeats([&]{ IrSender.sendSamsung(a, c, 0); })) {
+        recordSendDiagnostics(true, F("fallback-SAMSUNG"), SAMSUNG, 0, 0);
+        return true;
+      }
     }
     break;
 
   case 12: case 15:
-    if (doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); })) return true;
+    if (doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); })) {
+      recordSendDiagnostics(true, F("fallback-SONY"), SONY, 0, 0);
+      return true;
+    }
     break;
 
   case 16:
-    if (doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, 16, false); })) return true;
+    if (doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, 16, false); })) {
+      recordSendDiagnostics(true, F("fallback-JVC"), JVC, 0, 0);
+      return true;
+    }
     break;
 
   case 20:
-    if (doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, 20); })) return true;
+    if (doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, 20); })) {
+      recordSendDiagnostics(true, F("fallback-RC5"), RC5, 0, 0);
+      return true;
+    }
     break;
 }
+recordSendDiagnostics(false, F("fallback-failed"), t, rawOpt ? rawOpt->size() : 0, rawKhz);
 return false;
 }
 
 // === Odeslání „podle indexu“ – načte případný RAW a zavolá Core ===
 static bool irSendLearnedByIndex(int index, uint8_t repeats) {
   const LearnedCode* e = getLearnedByIndex(index);
-  if (!e) return false;
+  if (!e) {
+    recordSendDiagnostics(false, F("index-invalid"), UNKNOWN, 0, 0);
+    return false;
+  }
 
   std::vector<uint16_t> raw;
   uint8_t khz = 38;
@@ -605,8 +687,11 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
   if (rawOpt && !rawOpt->empty()) {
     rawSource = rawOpt;
   } else if (g_lastRawValid && !g_lastRaw.empty()) {
-    rawSource = &g_lastRaw;
-    freqKhz = g_lastRawKhz;
+    uint32_t age = millis() - g_lastRawCaptureMs;
+    if (age < 5000UL) {
+      rawSource = &g_lastRaw;
+      freqKhz = g_lastRawKhz;
+    }
   }
 
   if (rawSource && !rawSource->empty()) {
@@ -642,6 +727,7 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
     }
     if (rawSource == &g_lastRaw) {
       g_lastRawValid = false;
+      g_lastRawSource = F("(uloženo)");
       g_lastRaw.clear();
     }
   }
@@ -823,6 +909,7 @@ static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
       IrSender.sendRaw(raw.data(), static_cast<uint16_t>(raw.size()), freqKhz);
       if (r < repeats) delay(60);
     }
+    recordSendDiagnostics(true, F("raw-storage"), parseProtoLabel(e.proto), raw.size(), freqKhz);
     return true;
   }
 
@@ -884,9 +971,30 @@ static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
       // tyto protokoly typicky vyžadují oddělené parametry; bez RAW je nejisté
       return false;
 
-    default:
+  default:
       return false;
   }
+}
+
+static bool irSendLastRaw(uint8_t repeats) {
+  if (!g_lastRawValid || g_lastRaw.empty()) {
+    recordSendDiagnostics(false, F("raw-capture-missing"), UNKNOWN, 0, g_lastRawKhz);
+    return false;
+  }
+
+  Serial.print(F("[IR-TX] Posílám poslední zachycený RAW ("));
+  Serial.print(g_lastRaw.size());
+  Serial.print(F(" pulsů, "));
+  Serial.print(g_lastRawKhz);
+  Serial.println(F("kHz)"));
+
+  for (uint8_t r = 0; r <= repeats; ++r) {
+    IrSender.sendRaw(g_lastRaw.data(), static_cast<uint16_t>(g_lastRaw.size()), g_lastRawKhz);
+    if (r < repeats) delay(60);
+  }
+
+  recordSendDiagnostics(true, F("raw-capture"), UNKNOWN, g_lastRaw.size(), g_lastRawKhz);
+  return true;
 }
 
 
@@ -998,9 +1106,13 @@ static void initIrSender(int8_t pin) {
 // Bezpečný STUB – tvoje verze IRremote neumí přímo surový buffer.
 // Tímto jen resetneme případný předchozí RAW.
 static void captureLastRawFromReceiver() {
-  g_lastRawValid = false;
-  g_lastRaw.clear();
-  g_lastRawKhz = 38;
+  if (g_lastRawValid) {
+    g_lastRawCaptureMs = millis();
+  } else {
+    g_lastRawSource = F("(missing)");
+    Serial.println(F("[RAW] Upozornění: pro poslední rámec není dostupný RAW záznam."));
+  }
+  g_isrFrameReady = false;
 }
 
 // Jednotné mapování labelu na IRremote enum.
@@ -1055,6 +1167,68 @@ bool irSendEvent(const IREvent &ev, uint8_t repeats) {
   tmp.proto = String(protoName(ev.proto));
 
   return irSendLearnedCore(tmp, repeats, nullptr, 38);
+}
+
+String buildDiagnosticsJson() {
+  String out; out.reserve(512);
+  out += F("{\"raw\":{");
+  out += F("\"valid\":"); out += g_lastRawValid ? "true" : "false";
+  out += F(",\"source\":\""); out += jsonEscape(g_lastRawSource); out += F("\"");
+  out += F(",\"age_ms\":");
+  if (g_lastRawValid) {
+    out += static_cast<uint32_t>(millis() - g_lastRawCaptureMs);
+  } else {
+    out += 0;
+  }
+  out += F(",\"len\":"); out += static_cast<uint32_t>(g_lastRaw.size());
+  out += F(",\"freq\":"); out += static_cast<uint32_t>(g_lastRawKhz);
+
+  out += F(",\"preview\":[");
+  if (g_lastRawValid && !g_lastRaw.empty()) {
+    size_t limit = std::min<size_t>(g_lastRaw.size(), 16);
+    for (size_t i = 0; i < limit; ++i) {
+      if (i) out += ',';
+      out += static_cast<uint32_t>(g_lastRaw[i]);
+    }
+    out += F("]");
+    out += F(",\"preview_truncated\":");
+    out += (g_lastRaw.size() > limit) ? "true" : "false";
+  } else {
+    out += F("]");
+    out += F(",\"preview_truncated\":false");
+  }
+  out += F("},\"send\":{");
+  out += F("\"valid\":"); out += g_lastSendValid ? "true" : "false";
+  out += F(",\"ok\":"); out += g_lastSendOk ? "true" : "false";
+  out += F(",\"age_ms\":");
+  if (g_lastSendValid) {
+    out += static_cast<uint32_t>(millis() - g_lastSendMs);
+  } else {
+    out += 0;
+  }
+  out += F(",\"method\":\""); out += jsonEscape(g_lastSendMethod); out += F("\"");
+  out += F(",\"proto\":\""); out += jsonEscape(String(protoName(g_lastSendProto))); out += F("\"");
+  out += F(",\"freq\":"); out += static_cast<uint32_t>(g_lastSendFreq);
+  out += F(",\"pulses\":"); out += static_cast<uint32_t>(g_lastSendPulses);
+  out += F("}}");
+  out += F("}");
+  return out;
+}
+
+String buildRawDumpJson() {
+  if (!g_lastRawValid || g_lastRaw.empty()) {
+    return F("{\"ok\":false,\"err\":\"no_raw\"}");
+  }
+
+  String out; out.reserve(256 + g_lastRaw.size() * 6);
+  out += F("{\"ok\":true,\"freq\":"); out += static_cast<uint32_t>(g_lastRawKhz);
+  out += F(",\"source\":\""); out += jsonEscape(g_lastRawSource); out += F("\",\"data\":[");
+  for (size_t i = 0; i < g_lastRaw.size(); ++i) {
+    if (i) out += ',';
+    out += static_cast<uint32_t>(g_lastRaw[i]);
+  }
+  out += F("]}");
+  return out;
 }
 
 #include "WebUI.h"  // používá výše deklarované symboly
@@ -1137,7 +1311,7 @@ void loop() {
   if (!suppress) {
     printJSON(d, learned);
     addToHistory(d, learnedIndex);
-    captureLastRawFromReceiver();  // STUB – neplní RAW, jen udržuje kompatibilitu
+    captureLastRawFromReceiver();
   }
 
   lastMs   = now;

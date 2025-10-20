@@ -50,6 +50,14 @@ inline void handleRoot() {
     "th,td{border:1px solid var(--line);padding:6px 8px;font-size:14px;text-align:left}"
     "th{background:#f5f5f5;position:sticky;top:0}"
     "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    ".diag-grid{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}"
+    ".card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;flex:1;min-width:260px}"
+    ".card h3{margin:0 0 8px;font-size:16px}"
+    ".kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;font-size:13px}"
+    ".kv .label{color:var(--muted)}"
+    ".mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
+    ".status-ok{color:var(--ok);font-weight:600}"
+    ".status-err{color:var(--err);font-weight:600}"
     "#toast{position:fixed;right:12px;bottom:12px;display:none;padding:10px 12px;border-radius:8px;color:#fff;font-weight:500}"
     "#toast.ok{background:var(--ok)}#toast.err{background:var(--err)}"
     "#learnModal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)}"
@@ -71,6 +79,40 @@ inline void handleRoot() {
       "<a class='btn' href='/learned'>Naučené kódy</a>"
       "<a class='btn' href='/api/history'>API /history</a>"
       "<a class='btn' href='/api/learned'>API /learned</a>"
+    "</div>"
+  );
+
+  html += F(
+    "<div class='diag-grid'>"
+      "<div class='card'>"
+        "<h3>Diagnostika příjmu</h3>"
+        "<div class='kv'>"
+          "<span class='label'>Stav:</span><span id='rawState' class='muted'>Čekám na signál…</span>"
+          "<span class='label'>Zdroj:</span><span id='rawSource' class='mono'>–</span>"
+          "<span class='label'>Délka:</span><span id='rawLen'>0 pulzů</span>"
+          "<span class='label'>Frekvence:</span><span id='rawFreq'>0 kHz</span>"
+          "<span class='label'>Stáří:</span><span id='rawAge'>–</span>"
+        "</div>"
+        "<div class='kv' style='margin-top:8px'>"
+          "<span class='label'>Ukázka:</span><span id='rawPreview' class='mono muted'>—</span>"
+        "</div>"
+        "<div class='row' style='margin-top:10px'>"
+          "<button id='rawSendBtn' class='btn' disabled>Odeslat RAW</button>"
+          "<span class='muted'>repeat <input id='rawRepeat' type='number' min='0' max='3' value='0' style='width:60px'></span>"
+          "<a id='rawDownload' class='btn' href='/api/raw_dump' target='_blank'>Stáhnout JSON</a>"
+        "</div>"
+      "</div>"
+      "<div class='card'>"
+        "<h3>Diagnostika odesílání</h3>"
+        "<div class='kv'>"
+          "<span class='label'>Poslední stav:</span><span id='sendState' class='muted'>Bez záznamu</span>"
+          "<span class='label'>Metoda:</span><span id='sendMethod' class='mono'>–</span>"
+          "<span class='label'>Protokol:</span><span id='sendProto' class='mono'>–</span>"
+          "<span class='label'>Pulzy:</span><span id='sendPulses'>0</span>"
+          "<span class='label'>Frekvence:</span><span id='sendFreq'>–</span>"
+          "<span class='label'>Stáří:</span><span id='sendAge'>–</span>"
+        "</div>"
+      "</div>"
     "</div>"
   );
 
@@ -112,12 +154,28 @@ inline void handleRoot() {
     "const modal=document.getElementById('learnModal');"
     "const form=document.getElementById('learnForm');"
     "const cancelBtn=document.getElementById('cancelBtn');"
+    "const rawState=document.getElementById('rawState');"
+    "const rawSource=document.getElementById('rawSource');"
+    "const rawLen=document.getElementById('rawLen');"
+    "const rawFreq=document.getElementById('rawFreq');"
+    "const rawAge=document.getElementById('rawAge');"
+    "const rawPreview=document.getElementById('rawPreview');"
+    "const rawSendBtn=document.getElementById('rawSendBtn');"
+    "const rawRepeat=document.getElementById('rawRepeat');"
+    "const sendState=document.getElementById('sendState');"
+    "const sendMethod=document.getElementById('sendMethod');"
+    "const sendProto=document.getElementById('sendProto');"
+    "const sendPulses=document.getElementById('sendPulses');"
+    "const sendFreq=document.getElementById('sendFreq');"
+    "const sendAge=document.getElementById('sendAge');"
     "let state={onlyUnknown:false,tx:0};"
     "function showToast(msg,ok=true){toast.textContent=msg;toast.className=ok?'ok':'err';toast.style.display='block';setTimeout(()=>toast.style.display='none',2000)}"
     "function toHex(n){return '0x'+(Number(n)>>>0).toString(16).toUpperCase()}"
+    "function fmtAge(ms){if(!ms||ms<0)return '–';if(ms<1000)return ms+' ms';if(ms<60000)return (ms/1000).toFixed(1)+' s';return (ms/60000).toFixed(1)+' min'}"
     "function openLearn(v,b,a,f,p){form.value.value=v;form.bits.value=b;form.addr.value=a;form.flags.value=f;form.proto.value=p;modal.style.display='flex'}"
     "cancelBtn.onclick=()=>{modal.style.display='none'};"
     "modal.addEventListener('click',e=>{if(e.target===modal)modal.style.display='none'});"
+    "rawSendBtn.onclick=async()=>{rawSendBtn.disabled=true;let rep=parseInt(rawRepeat.value||'0',10);if(isNaN(rep))rep=0;rep=Math.max(0,Math.min(3,rep));try{const r=await fetch('/api/raw_send?repeat='+rep);const j=await r.json();if(j.ok){showToast('RAW odeslán.');}else{showToast(j.err||'Odeslání RAW selhalo',false);}}catch(err){showToast('Chyba odeslání RAW',false);}rawSendBtn.disabled=false;loadDiag();};"
 
     // Uložení learned
     "form.onsubmit=async e=>{e.preventDefault();"
@@ -126,7 +184,7 @@ inline void handleRoot() {
       "const body=new URLSearchParams(fd);"
       "try{const r=await fetch('/api/learn_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});"
            "const j=await r.json();"
-           "if(j.ok){showToast('Uloženo.');modal.style.display='none';loadHistory();}"
+           "if(j.ok){showToast('Uloženo.');modal.style.display='none';loadHistory(); loadDiag();}"
            "else{showToast(j.err||'Uložení selhalo',false)}"
       "}catch(err){showToast('Chyba připojení',false)}"
       "document.getElementById('saveLearn').disabled=false;"
@@ -148,7 +206,7 @@ inline void handleRoot() {
             "td(toHex(e.addr)); td(toHex(e.cmd)); td(toHex(e.value)); td(e.flags);"
             "const act=document.createElement('td');"
             "const sendBtn=document.createElement('button');sendBtn.className='btn';sendBtn.textContent='Odeslat';"
-            "sendBtn.onclick=async()=>{sendBtn.disabled=true;try{const r=await fetch('/api/history_send?ms='+e.ms);const j=await r.json();if(j.ok){showToast('Odesláno.');}else{showToast(j.err||'Odeslání selhalo',false);}}catch(err){showToast('Chyba odeslání',false);}sendBtn.disabled=false;};"
+            "sendBtn.onclick=async()=>{sendBtn.disabled=true;try{const r=await fetch('/api/history_send?ms='+e.ms);const j=await r.json();if(j.ok){showToast('Odesláno.');}else{showToast(j.err||'Odeslání selhalo',false);}}catch(err){showToast('Chyba odeslání',false);}sendBtn.disabled=false;loadDiag();};"
             "act.appendChild(sendBtn);"
             "if(e.proto.includes('UNKNOWN')||(!e.learned&&e.learned_proto==='')){"
               "const b=document.createElement('button');b.className='btn';b.textContent='Učit';b.style.marginLeft='6px';"
@@ -165,6 +223,26 @@ inline void handleRoot() {
       "}catch(err){/* noop */}"
     "}"
 
+    "async function loadDiag(){"
+      "try{const r=await fetch('/api/diag');const j=await r.json();"
+          "rawState.textContent=j.raw.valid?'Zachyceno':'Čekám na signál…';"
+          "rawState.className=j.raw.valid?'status-ok':'muted';"
+          "rawSource.textContent=j.raw.source||'–';"
+          "rawLen.textContent=j.raw.valid?(j.raw.len+' pulzů'):'0 pulzů';"
+          "rawFreq.textContent=j.raw.valid?((j.raw.freq||0)+' kHz'):'–';"
+          "rawAge.textContent=j.raw.valid?fmtAge(j.raw.age_ms||0):'–';"
+          "if(j.raw.preview&&j.raw.preview.length){rawPreview.textContent=j.raw.preview.join(', ')+(j.raw.preview_truncated?', …':'');rawPreview.className='mono';}else{rawPreview.textContent='—';rawPreview.className='mono muted';}"
+          "rawSendBtn.disabled=!j.raw.valid;"
+          "sendState.textContent=j.send.valid?(j.send.ok?'OK':'Chyba'):'Bez záznamu';"
+          "sendState.className=j.send.valid?(j.send.ok?'status-ok':'status-err'):'muted';"
+          "sendMethod.textContent=j.send.method||'–';"
+          "sendProto.textContent=j.send.proto||'–';"
+          "sendPulses.textContent=j.send.valid?(j.send.pulses+' pulzů'):'–';"
+          "sendFreq.textContent=j.send.valid&&(j.send.freq)?j.send.freq+' kHz':'–';"
+          "sendAge.textContent=j.send.valid?fmtAge(j.send.age_ms||0):'–';"
+      "}catch(err){/* noop */}"
+    "}"
+
     // Uložení nastavení bez reloadu
     "saveBtn.onclick=async()=>{"
       "saveBtn.disabled=true;"
@@ -172,14 +250,15 @@ inline void handleRoot() {
           "p.set('only_unk',onlyUnk.checked?'1':'0');"
           "if(txPin.value!=='') p.set('tx_pin',txPin.value);"
           "const r=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});"
-          "if(r.status===302||r.ok){showToast('Nastavení uloženo'); loadHistory();}"
+          "if(r.status===302||r.ok){showToast('Nastavení uloženo'); loadHistory(); loadDiag();}"
           "else showToast('Uložení nastavení selhalo',false);"
       "}catch(e){showToast('Chyba připojení',false)}"
       "saveBtn.disabled=false;"
     "};"
 
     // Init – načti historii a z API /history nahraj current TX pin/flag (přijdou nepřímo: only_unknown už je tam)
-    "document.addEventListener('DOMContentLoaded',()=>{loadHistory(); setInterval(loadHistory,2000);});"
+    "const refresh=()=>{loadHistory(); loadDiag();};"
+    "document.addEventListener('DOMContentLoaded',()=>{refresh(); setInterval(refresh,2000);});"
   );
 
   // Předvyplň aktuální hodnoty (serverem vložené)
@@ -526,6 +605,26 @@ inline void handleApiHistorySend() {
   server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"send failed\"}");
 }
 
+inline void handleApiDiag() {
+  server.send(200, "application/json", buildDiagnosticsJson());
+}
+
+inline void handleApiRawSend() {
+  uint8_t repeats = 0;
+  if (server.hasArg("repeat")) {
+    long r = strtol(server.arg("repeat").c_str(), nullptr, 10);
+    if (r < 0) r = 0;
+    if (r > 3) r = 3;
+    repeats = static_cast<uint8_t>(r);
+  }
+  bool ok = irSendLastRaw(repeats);
+  server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"no raw\"}");
+}
+
+inline void handleApiRawDump() {
+  server.send(200, "application/json", buildRawDumpJson());
+}
+
 
 // ====== Router a běh webu ======
 inline void startWebServer() {
@@ -543,6 +642,9 @@ inline void startWebServer() {
   server.on("/api/learn_delete", HTTP_POST, handleApiLearnDelete);
   server.on("/api/send", handleApiSend);
   server.on("/api/history_send", handleApiHistorySend);
+  server.on("/api/diag", handleApiDiag);
+  server.on("/api/raw_send", handleApiRawSend);
+  server.on("/api/raw_dump", handleApiRawDump);
 
   server.begin();
   Serial.println(F("[NET] WebServer běží na portu 80"));
