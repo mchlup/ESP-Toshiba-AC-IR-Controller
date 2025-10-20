@@ -8,6 +8,8 @@
 #include <FS.h>
 #include <vector>
 #include <unordered_map>
+#include <ctype.h>
+#include <algorithm>
 
 // ======================== Datové typy a pomocné struktury ========================
 
@@ -83,7 +85,19 @@ static String rawPathForIndex(size_t index) {
   return p;
 }
 
+static bool fsEnsureRawDir() {
+  if (LittleFS.exists("/learned")) {
+    return true;
+  }
+  return LittleFS.mkdir("/learned");
+}
+
 static bool fsSaveRawForIndex(size_t index, const uint16_t* buf, uint16_t len, uint8_t khz) {
+  if (!fsEnsureRawDir()) {
+    Serial.println(F("[FS] Nelze vytvořit adresář /learned pro RAW data."));
+    return false;
+  }
+
   File f = LittleFS.open(rawPathForIndex(index), "w");
   if (!f) return false;
   f.write(&khz, 1);
@@ -239,11 +253,14 @@ void refreshLearnedAssociations();
 
 static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out);
 static bool jsonExtractString(const String &line, const char *key, String &out);
+static bool parseRawDurationsArg(const String &arg, std::vector<uint16_t> &out);
 
 String fsReadLearnedAsArrayJSON();
 bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
                      const String &protoStr, const String &vendor,
-                     const String &functionName, const String &remoteLabel);
+                     const String &functionName, const String &remoteLabel,
+                     const std::vector<uint16_t> *rawOpt = nullptr,
+                     uint8_t rawKhz = 38);
 bool fsUpdateLearned(size_t index, const String &protoStr,
                      const String &vendor, const String &functionName, const String &remoteLabel);
 
@@ -495,6 +512,32 @@ static bool jsonExtractString(const String &line, const char *key, String &out) 
   return true;
 }
 
+static bool parseRawDurationsArg(const String &arg, std::vector<uint16_t> &out) {
+  out.clear();
+  const char *ptr = arg.c_str();
+  while (ptr && *ptr) {
+    while (*ptr && (isspace((unsigned char)*ptr) || *ptr == ',' || *ptr == ';' || *ptr == '[' || *ptr == ']')) {
+      ++ptr;
+    }
+    if (!*ptr) break;
+
+    char *endPtr = nullptr;
+    unsigned long val = strtoul(ptr, &endPtr, 0);
+    if (endPtr == ptr) {
+      return false;
+    }
+    if (out.size() >= RAW_MAX_PULSES) {
+      return false;
+    }
+    if (val > 0xFFFFUL) {
+      val = 0xFFFFUL;
+    }
+    out.push_back(static_cast<uint16_t>(val));
+    ptr = endPtr;
+  }
+  return !out.empty();
+}
+
 String fsReadLearnedAsArrayJSON() {
   File f = LittleFS.open(LEARN_FILE, FILE_READ);
   if (!f) return "[]";
@@ -532,12 +575,14 @@ String fsReadLearnedAsArrayJSON() {
 }
 
 
-// Pozn.: Pokud pošleš sem položku, jejíž value/bits/addr odpovídají poslednímu zachycenému kódu,
-// můžeš teoreticky doplnit RAW i bez přímého přístupu do interního bufferu knihovny.
-// Aktuálně je capture stub (bezpečné na tvé verzi), RAW očekáváme v souboru.
+// Pozn.: RAW je možné přidat dvěma způsoby – buď automaticky (přes g_lastRaw po zachycení rámce),
+// nebo explicitně předáním v parametru rawOpt (např. z API). Funkce se postará o serializaci do
+// JSON i o uložení binární kopie do LittleFS.
 bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
                      const String &protoStr, const String &vendor,
-                     const String &functionName, const String &remoteLabel) {
+                     const String &functionName, const String &remoteLabel,
+                     const std::vector<uint16_t> *rawOpt,
+                     uint8_t rawKhz) {
   File f = LittleFS.open(LEARN_FILE, FILE_APPEND);
   if (!f) return false;
 
@@ -554,37 +599,54 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
   line += F(",\"function\":\"");line += jsonEscape(functionName);   line += '\"';
   line += F(",\"remote_label\":\""); line += jsonEscape(remoteLabel); line += '\"';
 
-    // Pokud máme právě „čerstvý“ RAW (v této verzi typicky nemáme), přibalíme ho
-  if (g_lastRawValid && lastUnknown.value == value && lastUnknown.bits == bits && lastUnknown.address == addr) {
-    line += F(",\"raw\":[");
-    for (size_t i = 0; i < g_lastRaw.size(); i++) {
-      if (i) line += ',';
-      line += (uint32_t)g_lastRaw[i];
-    }
-    line += ']';
-    line += F(",\"freq\":"); line += (uint32_t)g_lastRawKhz;
+  const std::vector<uint16_t> *rawSource = nullptr;
+  uint8_t freqKhz = rawKhz ? rawKhz : 38;
+
+  if (rawOpt && !rawOpt->empty()) {
+    rawSource = rawOpt;
+  } else if (g_lastRawValid && !g_lastRaw.empty()) {
+    rawSource = &g_lastRaw;
+    freqKhz = g_lastRawKhz;
   }
 
+  if (rawSource && !rawSource->empty()) {
+    line += F(",\"raw\":[");
+    for (size_t i = 0; i < rawSource->size(); i++) {
+      if (i) line += ',';
+      line += (uint32_t)(*rawSource)[i];
+    }
+    line += ']';
+    line += F(",\"freq\":");
+    line += (uint32_t)freqKhz;
+  }
 
   line += F("}\n");
 
   size_t w = f.print(line);
   f.close();
   bool ok = (w == line.length());
-f.close();
 
-if (ok) {
+  if (!ok) {
+    return false;
+  }
+
   invalidateLearnedCache();
   refreshLearnedAssociations();
 
-  // Připoj RAW soubor k právě přidané položce (pokud je k dispozici)
-  if (g_lastRawValid && !g_lastRaw.empty()) {
-    size_t idx = getLearnedCount() ? (getLearnedCount() - 1) : 0;
-    fsSaveRawForIndex(idx, g_lastRaw.data(), (uint16_t)g_lastRaw.size(), g_lastRawKhz);
+  if (rawSource && !rawSource->empty()) {
+    size_t count = getLearnedCount();
+    if (count > 0) {
+      if (!fsSaveRawForIndex(count - 1, rawSource->data(), (uint16_t)rawSource->size(), freqKhz)) {
+        Serial.println(F("[FS] Varování: RAW data se nepodařilo uložit do binárního souboru."));
+      }
+    }
+    if (rawSource == &g_lastRaw) {
+      g_lastRawValid = false;
+      g_lastRaw.clear();
+    }
   }
-}
-return ok;
 
+  return true;
 }
 
 bool fsUpdateLearned(size_t index, const String &protoStr,
@@ -738,13 +800,28 @@ static bool fsReadLearnedRawByValue(uint32_t value, uint8_t bits, uint32_t addr,
 static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
   // 1) RAW z FS – pokud existuje, pošli přesně původní průběh
   std::vector<uint16_t> raw;
-  uint16_t freq = 38;
-  if (fsReadLearnedRawByValue(e.value, e.bits, e.addr, raw, freq)) {
+  uint8_t freqKhz = 38;
+  bool haveRaw = false;
+
+  int16_t idx = findLearnedIndex(e.value, e.bits, e.addr);
+  if (idx >= 0) {
+    haveRaw = fsLoadRawForIndex(static_cast<size_t>(idx), raw, freqKhz);
+  }
+
+  if (!haveRaw) {
+    uint16_t freqFromJson = freqKhz;
+    if (fsReadLearnedRawByValue(e.value, e.bits, e.addr, raw, freqFromJson)) {
+      freqKhz = (freqFromJson > 0) ? static_cast<uint8_t>(std::min<uint16_t>(freqFromJson, 255)) : 38;
+      haveRaw = true;
+    }
+  }
+
+  if (haveRaw && !raw.empty()) {
     Serial.print(F("[IR-TX] RAW len=")); Serial.print(raw.size());
-    Serial.print(F(" freq=")); Serial.print(freq); Serial.println(F("kHz"));
-    for (uint8_t r=0; r<=repeats; r++) {
-      IrSender.sendRaw(raw.data(), (uint16_t)raw.size(), freq);
-      delay(40);
+    Serial.print(F(" freq=")); Serial.print(freqKhz); Serial.println(F("kHz"));
+    for (uint8_t r = 0; r <= repeats; ++r) {
+      IrSender.sendRaw(raw.data(), static_cast<uint16_t>(raw.size()), freqKhz);
+      if (r < repeats) delay(60);
     }
     return true;
   }
@@ -951,7 +1028,9 @@ extern bool fsUpdateLearned(size_t index, const String &protoStr,
                             const String &vendor, const String &functionName, const String &remoteLabel);
 extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
                             const String &protoStr, const String &vendor,
-                            const String &functionName, const String &remoteLabel);
+                            const String &functionName, const String &remoteLabel,
+                            const std::vector<uint16_t> *rawOpt = nullptr,
+                            uint8_t rawKhz = 38);
 extern bool fsDeleteLearned(size_t index);
 extern bool isEffectivelyUnknownEvent(const IREvent &ev);
 extern bool irSendByIndex(int16_t idx, uint8_t repeats);

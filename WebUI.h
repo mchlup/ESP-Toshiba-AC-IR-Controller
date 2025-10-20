@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 // ====== Web UI / API (vylepšené, bez reloadů) ======
 //
 // Závislosti z .ino (beze změn):
@@ -17,7 +19,9 @@
 // - extern bool isEffectivelyUnknown(const IREvent& e);
 // - struct LearnedCode { uint32_t value, addr; uint8_t bits, flags; String proto,vendor,function,remote; };
 // - extern const LearnedCode* getLearnedByIndex(int idx);
-// - extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags, const String& proto, const String& vendor, const String& function, const String& remote);
+// - extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
+//                               const String& proto, const String& vendor, const String& function,
+//                               const String& remote, const std::vector<uint16_t>* rawOpt, uint8_t rawKhz);
 // - extern String fsReadLearnedAsArrayJSON();
 // - extern bool fsUpdateLearned(size_t index, const String& proto, const String& vendor, const String& function, const String& remote);
 // - extern bool irSendLearned(const LearnedCode &e, uint8_t repeats);
@@ -302,11 +306,6 @@ inline void handleLearnSave() {
   bool ok = fsAppendLearned(lastUnknown.value, lastUnknown.bits, lastUnknown.address, lastUnknown.flags,
                             String("UNKNOWN"), vendor, protoLabel, remoteLabel);
 
-  if (ok && g_lastRawValid) {
-    size_t idx = getLearnedCount() ? (getLearnedCount() - 1) : 0;
-    fsSaveRawForIndex(idx, g_lastRaw.data(), (uint16_t)g_lastRaw.size(), g_lastRawKhz);
-  }
-
   String html;
   html += F("<!doctype html><html><meta charset='utf-8'><title>Uloženo</title><body>");
   html += ok ? F("<p>✅ Kód uložen (včetně RAW, je-li k dispozici).</p>") : F("<p>❌ Uložení selhalo.</p>");
@@ -414,7 +413,36 @@ inline void handleApiLearnSave() {
   String remote = server.hasArg("remote_label") ? server.arg("remote_label") : "";
   remote.trim();
 
-  bool ok = fsAppendLearned(value, bits, addr, flags, proto, vendor, func, remote);
+  std::vector<uint16_t> rawFromRequest;
+  const std::vector<uint16_t>* rawPtr = nullptr;
+  uint8_t rawFreq = 38;
+
+  if (server.hasArg("raw") && server.arg("raw").length() > 0) {
+    if (!parseRawDurationsArg(server.arg("raw"), rawFromRequest)) {
+      server.send(400, "application/json", "{\"ok\":false,\"err\":\"invalid raw list\"}");
+      return;
+    }
+
+    auto parseFreq = [&](const String &s) {
+      if (!s.length()) return;
+      long freq = strtol(s.c_str(), nullptr, 10);
+      if (freq < 15) freq = 15;
+      if (freq > 80) freq = 80;
+      rawFreq = static_cast<uint8_t>(freq);
+    };
+
+    if (server.hasArg("freq")) {
+      parseFreq(server.arg("freq"));
+    } else if (server.hasArg("freq_khz")) {
+      parseFreq(server.arg("freq_khz"));
+    } else if (server.hasArg("khz")) {
+      parseFreq(server.arg("khz"));
+    }
+
+    rawPtr = &rawFromRequest;
+  }
+
+  bool ok = fsAppendLearned(value, bits, addr, flags, proto, vendor, func, remote, rawPtr, rawFreq);
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
