@@ -1141,8 +1141,8 @@ extern bool fsUpdateLearned(size_t index, const String &protoStr,
 extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
                             const String &protoStr, const String &vendor,
                             const String &functionName, const String &remoteLabel,
-                            const std::vector<uint16_t> *rawOpt = nullptr,
-                            uint8_t rawKhz = 38);
+                            const std::vector<uint16_t> *rawOpt,
+                            uint8_t rawKhz);
 extern bool fsDeleteLearned(size_t index);
 extern bool isEffectivelyUnknownEvent(const IREvent &ev);
 extern bool irSendByIndex(int16_t idx, uint8_t repeats);
