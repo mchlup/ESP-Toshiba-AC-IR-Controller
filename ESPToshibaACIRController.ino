@@ -599,7 +599,11 @@ bool fsUpdateLearned(size_t index, const String &protoStr,
   f.close();
   if (index >= lines.size()) return false;
 
-  String line = lines[index]; line.trim();
+  for (auto &ln : lines) {
+    ln.trim();
+  }
+
+  String line = lines[index];
   if (!line.length()) return false;
 
   auto replaceString = [&](const char* key, const String &val) {
@@ -617,12 +621,64 @@ bool fsUpdateLearned(size_t index, const String &protoStr,
   replaceString("function", functionName);
   replaceString("remote_label", remoteLabel);
 
-  lines[index] = line + "\n";
+  lines[index] = line;
 
   f = LittleFS.open(LEARN_FILE, FILE_WRITE);
   if (!f) return false;
-  for (auto &ln : lines) f.print(ln);
+  for (auto &ln : lines) {
+    if (!ln.length()) continue;
+    f.print(ln);
+    f.print('\n');
+  }
   f.close();
+
+  invalidateLearnedCache();
+  refreshLearnedAssociations();
+  return true;
+}
+
+bool fsDeleteLearned(size_t index) {
+  File f = LittleFS.open(LEARN_FILE, FILE_READ);
+  if (!f) return false;
+
+  std::vector<String> lines;
+  while (f.available()) {
+    lines.push_back(f.readStringUntil('\n'));
+  }
+  f.close();
+
+  if (index >= lines.size()) return false;
+
+  for (auto &ln : lines) {
+    ln.trim();
+  }
+
+  const size_t oldCount = lines.size();
+  lines.erase(lines.begin() + index);
+
+  f = LittleFS.open(LEARN_FILE, FILE_WRITE);
+  if (!f) return false;
+  for (auto &ln : lines) {
+    if (!ln.length()) continue;
+    f.print(ln);
+    f.print('\n');
+  }
+  f.close();
+
+  // Remove RAW capture for the deleted entry and shift subsequent files down.
+  String target = rawPathForIndex(index);
+  if (LittleFS.exists(target)) {
+    LittleFS.remove(target);
+  }
+  for (size_t i = index + 1; i < oldCount; ++i) {
+    String from = rawPathForIndex(i);
+    if (!LittleFS.exists(from)) continue;
+    String to = rawPathForIndex(i - 1);
+    if (LittleFS.exists(to)) {
+      LittleFS.remove(to);
+    }
+    LittleFS.rename(from.c_str(), to.c_str());
+  }
 
   invalidateLearnedCache();
   refreshLearnedAssociations();
@@ -896,14 +952,30 @@ extern bool fsUpdateLearned(size_t index, const String &protoStr,
 extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
                             const String &protoStr, const String &vendor,
                             const String &functionName, const String &remoteLabel);
+extern bool fsDeleteLearned(size_t index);
 extern bool isEffectivelyUnknownEvent(const IREvent &ev);
 extern bool irSendByIndex(int16_t idx, uint8_t repeats);
+extern bool irSendEvent(const IREvent &ev, uint8_t repeats);
 
 // Wrapper pro WebUI: odeslání podle indexu
 bool irSendByIndex(int16_t idx, uint8_t repeats) {
   const LearnedCode* e = getLearnedByIndex(idx);
   if (!e) return false;
   return irSendLearned(*e, repeats);
+}
+
+bool irSendEvent(const IREvent &ev, uint8_t repeats) {
+  if (ev.learnedIndex >= 0) {
+    return irSendLearnedByIndex(ev.learnedIndex, repeats);
+  }
+
+  LearnedCode tmp{};
+  tmp.value = ev.value;
+  tmp.bits  = ev.bits;
+  tmp.addr  = ev.address;
+  tmp.proto = String(protoName(ev.proto));
+
+  return irSendLearnedCore(tmp, repeats, nullptr, 38);
 }
 
 #include "WebUI.h"  // používá výše deklarované symboly
