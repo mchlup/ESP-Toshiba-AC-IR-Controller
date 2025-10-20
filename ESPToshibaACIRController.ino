@@ -887,96 +887,28 @@ static bool fsReadLearnedRawByValue(uint32_t value, uint8_t bits, uint32_t addr,
 // ======================== Odesílání naučeného (RAW-first) ========================
 
 static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
-  // 1) RAW z FS – pokud existuje, pošli přesně původní průběh
   std::vector<uint16_t> raw;
-  uint8_t freqKhz = 38;
-  bool haveRaw = false;
+  uint8_t rawFreq = 38;
+  const std::vector<uint16_t>* rawPtr = nullptr;
 
   int16_t idx = findLearnedIndex(e.value, e.bits, e.addr);
   if (idx >= 0) {
-    haveRaw = fsLoadRawForIndex(static_cast<size_t>(idx), raw, freqKhz);
-  }
-
-  if (!haveRaw) {
-    uint16_t freqFromJson = freqKhz;
-    if (fsReadLearnedRawByValue(e.value, e.bits, e.addr, raw, freqFromJson)) {
-      freqKhz = (freqFromJson > 0) ? static_cast<uint8_t>(std::min<uint16_t>(freqFromJson, 255)) : 38;
-      haveRaw = true;
+    if (fsLoadRawForIndex(static_cast<size_t>(idx), raw, rawFreq) && !raw.empty()) {
+      rawPtr = &raw;
     }
   }
 
-  if (haveRaw && !raw.empty()) {
-    Serial.print(F("[IR-TX] RAW len=")); Serial.print(raw.size());
-    Serial.print(F(" freq=")); Serial.print(freqKhz); Serial.println(F("kHz"));
-    for (uint8_t r = 0; r <= repeats; ++r) {
-      IrSender.sendRaw(raw.data(), static_cast<uint16_t>(raw.size()), freqKhz);
-      if (r < repeats) delay(60);
+  if (!rawPtr) {
+    uint16_t freqFromJson = rawFreq;
+    if (fsReadLearnedRawByValue(e.value, e.bits, e.addr, raw, freqFromJson) && !raw.empty()) {
+      rawFreq = (freqFromJson > 0)
+                  ? static_cast<uint8_t>(std::min<uint16_t>(freqFromJson, 255))
+                  : static_cast<uint8_t>(38);
+      rawPtr = &raw;
     }
-    recordSendDiagnostics(true, F("raw-storage"), parseProtoLabel(e.proto), raw.size(), freqKhz);
-    return true;
   }
 
-  // 2) Fallback podle protokolu
-  decode_type_t p = parseProtoLabel(e.proto);
-  if (p == UNKNOWN) {
-    decode_type_t histP = UNKNOWN;
-    if (findProtoInHistory(e.value, e.bits, e.addr, histP)) p = histP;
-  }
-
-  Serial.print(F("[IR-TX] proto="));
-  Serial.print((int)p);
-  Serial.print(F(" label='"));
-  Serial.print(e.proto);
-  Serial.print(F("' bits="));
-  Serial.print(e.bits);
-  Serial.print(F(" addr=0x"));
-  Serial.print(e.addr, HEX);
-  Serial.print(F(" value=0x"));
-  Serial.print(e.value, HEX);
-  Serial.print(F(" reps="));
-  Serial.println(repeats);
-
-  // jednotný cyklus opakování
-  auto sendLoop = [&](auto &&fnSendOnce) {
-    for (uint8_t r = 0; r <= repeats; r++) {
-      fnSendOnce();
-      delay(40);
-    }
-    return true;
-  };
-
-  switch (p) {
-    case NEC:
-      return sendLoop([&](){ IrSender.sendNEC((unsigned long)e.value, (int)e.bits); });
-
-    case SONY:
-      return sendLoop([&](){ IrSender.sendSony((unsigned long)e.value, (int)e.bits); });
-
-    case SAMSUNG: {
-      // IRremote: sendSamsung(uint16_t address, uint16_t command, int_fast8_t repeats)
-      uint16_t addr16 = (e.addr != 0) ? (uint16_t)e.addr : (uint16_t)(e.value >> 16);
-      uint16_t cmd16  = (uint16_t)(e.value & 0xFFFF);
-      return sendLoop([&](){ IrSender.sendSamsung(addr16, cmd16, 0); });
-    }
-
-    case JVC:
-      // použijeme overload (data, nbits, bool repeat=false) a opakujeme ručně
-      return sendLoop([&](){ IrSender.sendJVC((unsigned long)e.value, (int)e.bits, false); });
-
-    case RC5:
-      return sendLoop([&](){ IrSender.sendRC5((unsigned long)e.value, (int)e.bits); });
-
-    case RC6:
-      return sendLoop([&](){ IrSender.sendRC6((unsigned long)e.value, (int)e.bits); });
-
-    case PANASONIC:
-    case KASEIKYO:
-      // tyto protokoly typicky vyžadují oddělené parametry; bez RAW je nejisté
-      return false;
-
-  default:
-      return false;
-  }
+  return irSendLearnedCore(e, repeats, rawPtr, rawFreq);
 }
 
 static bool irSendLastRaw(uint8_t repeats) {
