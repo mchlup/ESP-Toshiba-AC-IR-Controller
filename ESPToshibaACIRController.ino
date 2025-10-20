@@ -1,292 +1,69 @@
-diff --git a/ESPToshibaACIRController.ino b/ESPToshibaACIRController.ino
-index 0000000..1111111 100644
---- a/ESPToshibaACIRController.ino
-+++ b/ESPToshibaACIRController.ino
-@@ -1,20 +1,92 @@
--#include <Arduino.h>
--#include <WiFi.h>
--#include <WebServer.h>
--#include <WiFiManager.h>
--#include <IRremote.hpp>
--#include <Preferences.h>
--#include <LittleFS.h>
--#include <FS.h>
-+// ===== Platforma / knihovny =====
-+#include <Arduino.h>
-+#include <WiFi.h>
-+#include <WebServer.h>
-+#include <WiFiManager.h>       // tzapu/WiFiManager
-+#include <IRremote.hpp>        // Armin Joachimsmeyer (IRremote 3.x)
-+#include <Preferences.h>       // NVS
-+#include <LittleFS.h>
-+#include <FS.h>
-+#include <ArduinoJson.h>
-+#include <vector>
-+#include <algorithm>
- 
--// ... (původní obsah)
-+// ===== HW piny (ESP32-C3 Super Mini) =====
-+#ifndef IR_RECEIVE_PIN
-+#define IR_RECEIVE_PIN 10
-+#endif
-+#ifndef IR_SEND_PIN
-+#define IR_SEND_PIN    5
-+#endif
-+
-+// Deduplikace a obecné konstanty
-+static const uint32_t DUP_FILTER_MS = 120;
-+static const uint16_t MAX_RAW_TICKS = 800; // bezpečný strop pro AC rámce
-+static const uint16_t TICK_US = 50;        // IRremote interní tiky ~50us
-+
-+// ===== Datové struktury (deklarováno dřív než použití!) =====
-+struct LearnedKey {
-+  uint32_t value{0};
-+  uint32_t addr{0};
-+  uint8_t  bits{0};
-+  bool operator==(const LearnedKey &o) const {
-+    return value == o.value && addr == o.addr && bits == o.bits;
-+  }
-+};
-+
-+struct LearnedCode {
-+  // metadata
-+  uint32_t ts{0};
-+  String   proto;           // textový název protokolu nebo "UNKNOWN"
-+  String   vendor;
-+  String   function;
-+  String   remote_label;
-+  // klíč dekódované hodnoty (pro TV apod.)
-+  LearnedKey key;
-+  // RAW ve "ticks" (50us) – u AC klíčové
-+  std::vector<uint16_t> raw_ticks;
-+  // flags apod. – pro budoucí rozšíření
-+  uint32_t flags{0};
-+};
-+
-+// Uložená databáze v paměti (mirroring pro UI); zdroj pravdy je LittleFS JSON
-+static std::vector<LearnedCode> g_codes;
- 
- // ====== Web server ======
- using WebSrv = WebServer;
- static WebSrv server(80);
- 
-+// ====== Pomocné: převody RAW (ticks <-> usec) ======
-+static inline uint16_t tickToUs(uint16_t t) { return (uint16_t)(t * TICK_US); }
-+static inline uint16_t usToTick(uint32_t us) {
-+  return (uint16_t)std::min<uint32_t>((us + (TICK_US/2)) / TICK_US, 0xFFFF);
-+}
-+
-+// ====== IR Init ======
-+static void irInit() {
-+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN);
-+  IrSender.begin(IR_SEND_PIN, ENABLE_LED_FEEDBACK);
-+}
-+
-+// ====== RAW grab z posledního přijatého rámce ======
-+static void copyRawToTicks(std::vector<uint16_t> &out) {
-+  out.clear();
-+  if (IrReceiver.decodedIRData.rawDataPtr == nullptr) return;
-+  // IRremote rawbuf je v "ticks" (50us)
-+  const uint16_t *rb = IrReceiver.decodedIRData.rawDataPtr->rawbuf;
-+  uint16_t len = IrReceiver.decodedIRData.rawDataPtr->rawlen;
-+  if (!rb || len == 0) return;
-+  len = std::min<uint16_t>(len, MAX_RAW_TICKS);
-+  out.reserve(len);
-+  for (uint16_t i = 0; i < len; i++) out.push_back(rb[i]);
-+}
-+
-+// ====== Odeslání – preferuj RAW, fallback na protokol ======
-+static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
-+  if (!e.raw_ticks.empty()) {
-+    static std::vector<uint16_t> raw_us; raw_us.clear(); raw_us.reserve(e.raw_ticks.size());
-+    for (auto t : e.raw_ticks) raw_us.push_back(tickToUs(t));
-+    IrSender.sendRaw(raw_us.data(), raw_us.size(), 38 /*kHz*/, repeats);
-+    return true;
-+  }
-+  // TV protokoly (pokud existují smysluplná data):
-+  if (e.key.bits && e.key.value) {
-+    // Heuristika – zkus NEC podle délky bitů; případně přidej další podle e.proto
-+    IrSender.sendNEC(e.key.value, e.key.bits, repeats);
-+    return true;
-+  }
-+  return false;
-+}
-+
- // ====== Uložení / načtení databáze (LittleFS) ======
- static const char *LEARN_DB = "/learned.json";
- 
-@@ -30,19 +102,148 @@
-   // ... původní init
- }
- 
--// === IR receive loop ===
-+// === IR receive loop – naučení ===
- static uint32_t s_lastLearnMs = 0;
- 
- static void irLearnLoop() {
-   if (!IrReceiver.decode()) return;
- 
--  IRData d = IrReceiver.decodedIRData;
-+  IRData d = IrReceiver.decodedIRData; // kopie pro čitelnost
-   uint32_t nowMs = millis();
--  // původní zpracování...
-+  // dup filtr
-+  if (nowMs - s_lastLearnMs < DUP_FILTER_MS) { IrReceiver.resume(); return; }
-+
-+  LearnedCode rec;
-+  rec.ts = nowMs;
-+  rec.proto = String(getProtocolString(d.protocol));
-+  rec.key.value = d.decodedRawData;
-+  rec.key.bits  = d.numberOfBits;
-+  rec.key.addr  = d.address;
-+  copyRawToTicks(rec.raw_ticks);
-+
-+  // noise filtr
-+  bool noise = false;
-+  if (d.flags & IRDATA_FLAGS_WAS_OVERFLOW) noise = true;
-+  if (d.protocol == UNKNOWN && rec.raw_ticks.size() < 8) noise = true; // příliš krátké
-+  if (noise) { IrReceiver.resume(); return; }
-+
-+  // přidej do RAM seznamu
-+  g_codes.push_back(std::move(rec));
-+  s_lastLearnMs = nowMs;
-+
-+  // připojit logiku: autosave do FS (append-safe)
-+  // Z důvodu velikosti RAW ukládáme streamově:
-+  File f = LittleFS.open(LEARN_DB, "w");
-+  if (f) {
-+    // serialize JSON ručně kvůli velkým RAW
-+    f.print("[");
-+    for (size_t i=0;i<g_codes.size();i++) {
-+      const auto &e = g_codes[i];
-+      f.print("{\"ts\":"); f.print(e.ts);
-+      f.print(",\"proto\":\""); f.print(e.proto); f.print("\"");
-+      f.print(",\"bits\":"); f.print(e.key.bits);
-+      f.print(",\"addr\":"); f.print(e.key.addr);
-+      f.print(",\"value\":"); f.print(e.key.value);
-+      if (!e.vendor.isEmpty()) { f.print(",\"vendor\":\""); f.print(e.vendor); f.print("\""); }
-+      if (!e.function.isEmpty()) { f.print(",\"function\":\""); f.print(e.function); f.print("\""); }
-+      if (!e.remote_label.isEmpty()) { f.print(",\"remote_label\":\""); f.print(e.remote_label); f.print("\""); }
-+      // RAW ticks
-+      if (!e.raw_ticks.empty()) {
-+        f.print(",\"raw_ticks\":[");
-+        for (size_t j=0;j<e.raw_ticks.size();j++) { if (j) f.print(','); f.print(e.raw_ticks[j]); }
-+        f.print("]");
-+      }
-+      f.print("}");
-+      if (i+1<g_codes.size()) f.print(",");
-+    }
-+    f.print("]");
-+    f.close();
-+  }
-+
-+  IrReceiver.resume();
- }
- 
- // === HTTP handlers ===
- static void handleSend() {
-   if (!server.hasArg("id")) { server.send(400, "text/plain", "missing id"); return; }
-   int id = server.arg("id").toInt();
-   if (id < 0 || id >= (int)g_codes.size()) { server.send(404, "text/plain", "not found"); return; }
--  // původní odeslání...
--  server.send(200, "application/json", "{\"ok\":true}");
-+  bool ok = irSendLearned(g_codes[id], /*repeats*/0);
-+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
- }
- 
-+// === WebUI – nový CSS/JS ===
-+static const char APP_CSS[] PROGMEM = R"CSS(
-+:root{--bg:#0b1020;--card:#111832;--muted:#98a2b3;--txt:#e6e9ef;--accent:#6ea8fe;--ok:#35c46a;--warn:#f0b429;}
-+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 system-ui}a{color:var(--accent);text-decoration:none}
-+.container{max-width:980px;margin:16px auto;padding:0 12px;display:grid;gap:12px}
-+.card{background:var(--card);border-radius:14px;padding:12px;box-shadow:0 2px 18px #0005}
-+.row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
-+.btn{appearance:none;border:1px solid #2b375c;background:#1b2547;color:var(--txt);padding:8px 12px;border-radius:10px;cursor:pointer}
-+.btn.primary{background:var(--accent);border-color:transparent;color:#101319}
-+.btn.ghost{background:transparent;border-color:#2b375c}
-+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1a2242;color:var(--muted);font-size:12px}
-+.list{display:grid;gap:8px}
-+.item{display:grid;grid-template-columns:56px 1fr auto;gap:8px;align-items:center;padding:8px;border-radius:12px;border:1px solid #222a4a}
-+.item .proto{font-weight:600}
-+.search{display:grid;grid-template-columns:1fr auto auto;gap:8px}
-+.ok{color:var(--ok)}.warn{color:var(--warn)}
-+)CSS";
-+
-+static const char APP_JS[] PROGMEM = R"JS(
-+const el = s=>document.querySelector(s);let DATA=[];
-+async function load(){ const r = await fetch('/learned.json',{cache:'no-store'}); DATA = await r.json(); render(DATA); }
-+function render(arr){
-+  const root = el('#list'); root.innerHTML='';
-+  arr.forEach((e,i)=>{
-+    const it=document.createElement('div'); it.className='item';
-+    it.innerHTML = `
-+      <div><div class="pill">${e.proto||'UNKNOWN'}</div><div class="pill">${e.bits||0}b</div></div>
-+      <div><div class="proto">${e.function||'(bez názvu)'} <span class="pill">ID ${i}</span></div>
-+           <div class="muted">${new Date(e.ts).toLocaleString()} · ${e.vendor||''}</div></div>
-+      <div class="row">
-+        <button class="btn" data-send="${i}">Odeslat</button>
-+        <button class="btn ghost" data-del="${i}">Smazat</button>
-+      </div>`;
-+    root.appendChild(it);
-+  });
-+}
-+document.addEventListener('click', async (ev)=>{
-+  const s=ev.target.dataset.send, d=ev.target.dataset.del;
-+  if (s!==undefined){ ev.target.disabled=true; ev.target.textContent='Posílám…';
-+    const r=await fetch('/send?id='+s); const js=await r.json();
-+    ev.target.textContent = js.ok?'Odesláno ✓':'Chyba ✕'; setTimeout(()=>{ev.target.textContent='Odeslat';ev.target.disabled=false;}, 1200);
-+  }
-+  if (d!==undefined){ if(!confirm('Smazat záznam?'))return; await fetch('/delete?id='+d); load(); }
-+});
-+el('#q').addEventListener('input', ev=>{
-+  const q=ev.target.value.toLowerCase();
-+  const f=DATA.filter(e=>(e.function||'').toLowerCase().includes(q)||(e.vendor||'').toLowerCase().includes(q)||(e.proto||'').toLowerCase().includes(q));
-+  render(f);
-+});
-+load();
-+)JS";
-+
-+static void handleRoot() {
-+  String html;
-+  html.reserve(6000);
-+  html += F("<!doctype html><html lang='cs'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-+  html += F("<title>ESP IR Controller</title><style>");
-+  html += FPSTR(APP_CSS);
-+  html += F("</style></head><body><div class='container'>");
-+  html += F("<div class='card'><div class='row'><h2>ESP-IR Controller</h2><span class='pill'>Wi-Fi OK</span></div>");
-+  html += F("<div class='search'><input id='q' class='btn' placeholder='Hledat…'><button onclick='location.reload()' class='btn ghost'>Obnovit</button><a href=\"/learn\" class='btn'>Učit</a></div></div>");
-+  html += F("<div class='card'><h3>Naučené kódy</h3><div id='list' class='list'></div></div>");
-+  html += F("</div><script>");
-+  html += FPSTR(APP_JS);
-+  html += F("</script></body></html>");
-+  server.send(200, "text/html; charset=utf-8", html);
-+}
-+
-+// === setup / loop ===
-+void setup() {
-+  // ... WiFiManager atd.
-+  LittleFS.begin(true);
-+  irInit();
-+  server.on("/", handleRoot);
-+  server.on("/send", HTTP_GET, handleSend);
-+  // ... další handlery (save/delete/load) beze změny API
-+  server.begin();
-+}
-+void loop() {
-+  server.handleClient();
-+  irLearnLoop();
-+}#include <Arduino.h>
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WiFiManager.h>     // tzapu/WiFiManager
-#include <IRremote.hpp>      // Armin Joachimsmeyer (IRremote.hpp)
-#include <Preferences.h>     // NVS (nastavení)
-#include <LittleFS.h>        // souborový systém pro "learned" databázi
+#include <WiFiManager.h>
+#include <IRremote.hpp>
+#include <Preferences.h>
+#include <LittleFS.h>
 #include <FS.h>
 #include <vector>
 #include <unordered_map>
 
-// ========= PŘEDDEKLARACE / GLOBÁLY (pořadí důležité) =========
+// === Přesuň DEFINICE typů nahoru (před první funkci) ===
+
+// Z klíče pro indexaci naučených kódů
+struct LearnedKey {
+  uint32_t value;
+  uint32_t addr;
+  uint8_t  bits;
+  bool operator==(const LearnedKey &o) const {
+    return value == o.value && addr == o.addr && bits == o.bits;
+  }
+};
+struct LearnedKeyHash {
+  size_t operator()(const LearnedKey &k) const {
+    size_t h = static_cast<size_t>(k.value);
+    h ^= static_cast<size_t>(k.addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= static_cast<size_t>(k.bits) * 0x27d4eb2d;
+    return h;
+  }
+};
+
+// IR historie (potřebuje decode_type_t z IRremote.hpp)
+struct IREvent {
+  uint32_t ms;
+  decode_type_t proto;
+  uint8_t  bits;
+  uint32_t address;
+  uint16_t command;
+  uint32_t value;
+  uint32_t flags;
+  int16_t  learnedIndex; // index do cache naučených kódů, -1 pokud neexistuje
+};
+
+// Záznam naučeného kódu (metadata + hodnoty)
+struct LearnedCode {
+  uint32_t value;
+  uint8_t  bits;
+  uint32_t addr;
+  String   proto;
+  String   vendor;
+  String   function;
+  String   remote;
+};
+
+// Číselná část řádku v /learned.jsonl (pro přepis)
+struct LearnedLineDetails {
+  uint32_t ts;
+  uint32_t value;
+  uint8_t  bits;
+  uint32_t addr;
+  uint32_t flags;
+};
+
+static inline LearnedKey makeLearnedKey(uint32_t value, uint8_t bits, uint32_t addr) {
+  return LearnedKey{ value, addr, bits };
+}
 
 // FIX: server musí být deklarován dřív, než ho použijí handlery
 WebServer server(80);
@@ -295,13 +72,8 @@ WebServer server(80);
 static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out);
 static bool jsonExtractString(const String &line, const char *key, String &out);
 
-// Předdeklarace struktur používaných v signaturách
-struct IREvent;
-struct LearnedCode;
-struct LearnedLineDetails;
-
 // ==== HW ====
-static const int8_t IR_TX_PIN_DEFAULT = 0;   // ESP32-C3: GPIO7 běžně volné
+static const int8_t IR_TX_PIN_DEFAULT = 0;   // ESP32-C3: výchozí TX pin
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_RX_PIN = 10;         // ESP32-C3: 4/5/10 fungují
 
@@ -329,16 +101,6 @@ static const char* LEARN_FILE = "/learned.jsonl";
 static bool g_showOnlyUnknown = false;
 
 // ====== Historie IR (ring buffer) ======
-struct IREvent {
-  uint32_t ms;
-  decode_type_t proto;
-  uint8_t bits;
-  uint32_t address;
-  uint16_t command;
-  uint32_t value;
-  uint32_t flags;
-  int16_t learnedIndex; // index do cache naučených kódů, -1 pokud neexistuje
-};
 static const size_t HISTORY_LEN = 10;
 static IREvent history[HISTORY_LEN];
 static size_t histWrite = 0;
@@ -355,42 +117,6 @@ static uint8_t lastBits = 0;
 static uint32_t lastMs = 0;
 
 // ====== Learned cache ======
-
-// FIX: LearnedCode musí být kompletní dřív, než se použije v irSendLearned()
-struct LearnedKey {
-  uint32_t value;
-  uint32_t addr;
-  uint8_t bits;
-
-  bool operator==(const LearnedKey &o) const {
-    return value == o.value && addr == o.addr && bits == o.bits;
-  }
-};
-
-struct LearnedKeyHash {
-  size_t operator()(const LearnedKey &k) const {
-    size_t h = static_cast<size_t>(k.value);
-    h ^= static_cast<size_t>(k.addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= static_cast<size_t>(k.bits) * 0x27d4eb2d;
-    return h;
-  }
-};
-
-static LearnedKey makeLearnedKey(uint32_t value, uint8_t bits, uint32_t addr) {
-  LearnedKey key{value, addr, bits};
-  return key;
-}
-
-struct LearnedCode {
-  uint32_t value;
-  uint8_t  bits;
-  uint32_t addr;
-  String   proto;
-  String   vendor;
-  String   function;
-  String   remote;
-};
-
 static std::vector<LearnedCode> g_learnedCache;
 static std::unordered_map<LearnedKey, int16_t, LearnedKeyHash> g_learnedIndex;
 static bool g_learnedCacheValid = false;
@@ -443,7 +169,6 @@ static bool findProtoInHistory(uint32_t value, uint8_t bits, uint32_t addr, deco
   return false;
 }
 
-// === Odeslání naučeného záznamu podle protokolu ===
 // ========== Odeslání naučeného kódu ==========
 static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
   decode_type_t p = parseProtoLabel(e.proto);
@@ -638,33 +363,30 @@ void wifiSetupWithWiFiManager() {
   wm.setTitle("IR Receiver – WiFi Setup");
   wm.setHostname("ir-receiver");
 
+  // Rozumné timeouty
+  wm.setConnectTimeout(20);   // s na připojení k uložené WiFi
+  wm.setConfigPortalTimeout(180); // s pro konfigurační AP
+
   String apName = makeApName();
-  Serial.print(F("[NET] Připojuji Wi-Fi… "));
-  if (!wm.autoConnect(apName.c_str())) {
-    Serial.println(F("neúspěch, restartuji…"));
-    delay(1000);
-    ESP.restart();
+  Serial.print(F("[NET] Připojuji Wi-Fi / otevírám portál… "));
+  bool ok = wm.autoConnect(apName.c_str());  // blokuje max 180 s
+  if (!ok) {
+    Serial.println(F("nepodařilo se. Zařízení běží bez Wi-Fi (AP portál vypršel)."));
+  } else {
+    Serial.println(F("OK"));
+    Serial.print(F("[NET] IP: "));
+    Serial.println(WiFi.localIP());
   }
-  Serial.println(F("OK"));
-  Serial.print(F("[NET] IP: "));
-  Serial.println(WiFi.localIP());
 }
 
 // ====== FS „databáze“ learned kódů (JSON Lines) ======
-struct LearnedLineDetails {
-  uint32_t ts;
-  uint32_t value;
-  uint8_t  bits;
-  uint32_t addr;
-  uint32_t flags;
-};
 
 static bool isWhitespace(char c) {
   return c==' '||c=='\t'||c=='\n'||c=='\r';
 }
 
 static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out) {
-  String pattern = String('"') + key + String("\":");
+  String pattern = String('\"') + key + String("\":");
   int idx = line.indexOf(pattern);
   if (idx < 0) return false;
   idx += pattern.length();
@@ -683,7 +405,7 @@ static bool jsonExtractUint32(const String &line, const char *key, uint32_t &out
 }
 
 static bool jsonExtractString(const String &line, const char *key, String &out) {
-  String pattern = String('"') + key + String("\":\"");
+  String pattern = String('\"') + key + String("\":\"");
   int idx = line.indexOf(pattern);
   if (idx < 0) return false;
   idx += pattern.length();
@@ -694,7 +416,7 @@ static bool jsonExtractString(const String &line, const char *key, String &out) 
       if (idx >= (int)line.length()) break;
       char esc = line[idx++];
       switch (esc) {
-        case '"': result += '"'; break;
+        case '\"': result += '\"'; break;
         case '\\': result += '\\'; break;
         case '/': result += '/'; break;
         case 'b': result += '\b'; break;
@@ -704,7 +426,7 @@ static bool jsonExtractString(const String &line, const char *key, String &out) 
         case 't': result += '\t'; break;
         default:  result += esc; break;
       }
-    } else if (c == '"') { out = result; return true; }
+    } else if (c == '\"') { out = result; return true; }
     else { result += c; }
   }
   return false;
@@ -731,13 +453,13 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
   line.reserve(320);
   line += '{';
   line += F("\"ts\":");         line += static_cast<uint32_t>(millis());
-  line += F(",\"proto\":\"");   line += protoStr;                   line += '"';
+  line += F(",\"proto\":\"");   line += protoStr;                   line += '\"';
   line += F(",\"value\":");     line += value;
   line += F(",\"bits\":");      line += static_cast<uint32_t>(bits);
   line += F(",\"addr\":");      line += addr;
   line += F(",\"flags\":");     line += flags;
-  line += F(",\"vendor\":\"");  line += jsonEscape(vendor);         line += '"';
-  line += F(",\"function\":\"");line += jsonEscape(functionName);   line += '"';
+  line += F(",\"vendor\":\"");  line += jsonEscape(vendor);         line += '\"';
+  line += F(",\"function\":\"");line += jsonEscape(functionName);   line += '\"';
   line += F(",\"remote_label\":\""); line += jsonEscape(remoteLabel); line += F("\"}\n");
 
   size_t w = f.print(line);
@@ -772,13 +494,13 @@ bool fsUpdateLearned(size_t index, const String &protoStr,
   line.reserve(320);
   line += '{';
   line += F("\"ts\":");         line += details.ts;
-  line += F(",\"proto\":\"");   line += proto;                    line += '"';
+  line += F(",\"proto\":\"");   line += proto;                    line += '\"';
   line += F(",\"value\":");     line += details.value;
   line += F(",\"bits\":");      line += static_cast<uint32_t>(details.bits);
   line += F(",\"addr\":");      line += details.addr;
   line += F(",\"flags\":");     line += details.flags;
-  line += F(",\"vendor\":\"");  line += jsonEscape(vendor);       line += '"';
-  line += F(",\"function\":\"");line += jsonEscape(functionName); line += '"';
+  line += F(",\"vendor\":\"");  line += jsonEscape(vendor);       line += '\"';
+  line += F(",\"function\":\"");line += jsonEscape(functionName); line += '\"';
   line += F(",\"remote_label\":\""); line += jsonEscape(remoteLabel); line += F("\"}");
 
   lines[index] = line;
@@ -841,7 +563,7 @@ void ensureLearnedCacheLoaded() {
         jsonExtractString(line, "remote_label", entry.remote);
         g_learnedCache.push_back(entry);
         const int16_t idx = static_cast<int16_t>(g_learnedCache.size() - 1);
-        LearnedKey key = makeLearnedKey(entry.value, entry.bits, entry.addr);
+        LearnedKey key{ entry.value, entry.addr, entry.bits };
         g_learnedIndex.emplace(key, idx);
       }
     }
@@ -859,7 +581,7 @@ const LearnedCode* getLearnedByIndex(int16_t idx) {
 
 int16_t findLearnedIndex(uint32_t value, uint8_t bits, uint32_t addr) {
   ensureLearnedCacheLoaded();
-  LearnedKey key = makeLearnedKey(value, bits, addr);
+  LearnedKey key{ value, addr, bits };
   auto it = g_learnedIndex.find(key);
   if (it == g_learnedIndex.end()) return -1;
   return it->second;
@@ -965,7 +687,6 @@ void handleRoot() {
       html += static_cast<uint32_t>(e.bits);    html += F(",");
       html += static_cast<uint32_t>(e.address); html += F(",");
       html += static_cast<uint32_t>(e.flags);   html += F(",");
-      // ↓↓↓ pošli skutečný známý protokol (z learned, jinak z dekodéru)
       html += '\'';
       if (learned && learned->proto.length()) html += learned->proto;
       else                                    html += String(protoName(e.proto));
@@ -1296,8 +1017,6 @@ void handleApiLearnSave() {
   String proto = server.arg("proto"); proto.trim();
   decode_type_t p = parseProtoLabel(proto);
   if (p == UNKNOWN) {
-    // fallback: když nám poslali nepodporovaný text, vezmi, co skutečně detekoval dekodér naposledy
-    // (můžeš si sem předat IRData z historie; anebo jen odmítnout uložení s err)
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"unsupported proto label\"}");
     return;
   }
@@ -1330,7 +1049,6 @@ void handleApiLearnUpdate() {
 }
 
 // === /api/send (GET) – odeslání vybraného naučeného kódu ===
-// FIX: JSON literály mají escapované uvozovky; žádné F("...") s neescapovanými "…"
 static void handleApiSend() {
   if (!server.hasArg("index")) {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing index\"}");
@@ -1352,13 +1070,11 @@ static void handleApiSend() {
   const bool ok = irSendLearned(*e, reps);
   if (ok) { server.send(200, "application/json", "{\"ok\":true}"); return; }
 
-  // Rozlišíme UNKNOWN vs. neznámý text
   String why = "unsupported protocol";
   if (parseProtoLabel(e->proto) == UNKNOWN) why = "proto UNKNOWN or not mapped";
   String resp = String("{\"ok\":false,\"err\":\"") + why + "\"}";
   server.send(501, "application/json", resp);
 }
-
 
 // ====== Router a běh webu ======
 void startWebServer() {
