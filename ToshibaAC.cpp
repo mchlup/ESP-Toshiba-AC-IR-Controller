@@ -1,4 +1,8 @@
 #include "ToshibaAC.h"
+
+// Globální instance deklarovaná v hlavním .ino souboru.
+extern ToshibaACIR toshiba;
+
 // implementace je kompletně v hlavičce (header-only) kvůli optimalizaci a jednoduchosti
 void sendHeat23Fan3() {
   ToshibaACIR::State s;
