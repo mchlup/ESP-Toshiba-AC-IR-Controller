@@ -1,157 +1,186 @@
 #pragma once
 
-// ====== Web UI / API ======
+// ====== Web UI / API (vylepšené, bez reloadů) ======
+//
+// Závislosti z .ino (beze změn):
+// - extern WebServer server;
+// - extern Preferences prefs;
+// - extern bool g_showOnlyUnknown;
+// - extern int8_t g_irTxPin;
+// - extern const size_t HISTORY_LEN;
+// - extern volatile size_t histWrite, histCount;
+// - struct IREvent { uint32_t ms,value,address,command; uint8_t bits,flags; decode_type_t proto; int learnedIndex; };
+// - extern IREvent history[];
+// - extern bool hasLastUnknown; extern IREvent lastUnknown;
+// - extern String jsonEscape(const String&);
+// - extern const __FlashStringHelper* protoName(decode_type_t);
+// - extern bool isEffectivelyUnknown(const IREvent& e);
+// - struct LearnedCode { uint32_t value, addr; uint8_t bits, flags; String proto,vendor,function,remote; };
+// - extern const LearnedCode* getLearnedByIndex(int idx);
+// - extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags, const String& proto, const String& vendor, const String& function, const String& remote);
+// - extern String fsReadLearnedAsArrayJSON();
+// - extern bool fsUpdateLearned(size_t index, const String& proto, const String& vendor, const String& function, const String& remote);
+// - extern bool irSendLearned(const LearnedCode &e, uint8_t repeats);
+// - extern decode_type_t parseProtoLabel(const String&);
+// - extern void initIrSender(int8_t txPin);
 
 inline void handleRoot() {
   String html;
-  html.reserve(9000);
+  html.reserve(12000);
   html += F(
     "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>IR Receiver – ESP32-C3</title>"
     "<style>"
-    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
+    ":root{--bg:#fff;--muted:#666;--line:#e5e5e5;--card:#fafafa;--btn:#f6f6f6;--ok:#15a34a;--err:#dc2626}"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;background:var(--bg)}"
     "h1{font-size:20px;margin:0 0 12px}"
-    ".muted{color:#666}"
-    "table{border-collapse:collapse;width:100%;max-width:980px}"
-    "th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}"
-    "th{background:#f5f5f5}"
+    ".muted{color:var(--muted)}"
+    ".row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}"
+    ".btn{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:var(--btn);text-decoration:none;color:#222;cursor:pointer}"
+    ".btn[disabled]{opacity:.5;cursor:not-allowed}"
+    "input[type=number]{width:84px;padding:4px 6px}"
+    "table{border-collapse:collapse;width:100%;max-width:1100px;margin-top:8px}"
+    "th,td{border:1px solid var(--line);padding:6px 8px;font-size:14px;text-align:left}"
+    "th{background:#f5f5f5;position:sticky;top:0}"
     "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
-    "a.btn,button.btn{display:inline-block;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa;text-decoration:none;color:#222}"
-    ".row{margin:8px 0}"
+    "#toast{position:fixed;right:12px;bottom:12px;display:none;padding:10px 12px;border-radius:8px;color:#fff;font-weight:500}"
+    "#toast.ok{background:var(--ok)}#toast.err{background:var(--err)}"
+    "#learnModal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)}"
+    "#learnModal .card{background:#fff;padding:16px 16px 12px;border-radius:10px;min-width:300px;max-width:90vw}"
+    "#learnModal label{display:block;margin:6px 0 2px}"
+    "#learnModal input[type=text]{width:100%;max-width:420px;padding:6px 8px}"
     "</style></head><body>"
   );
-  html += F("<h1>IR Receiver – ESP32-C3</h1>");
 
-  html += F("<div class='muted'>IP: ");
-  html += WiFi.localIP().toString();
-  html += F(" &nbsp; | &nbsp; RSSI: ");
-  html += WiFi.RSSI();
-  html += F(" dBm</div>");
+  html += F("<h1>IR Receiver – ESP32-C3</h1><div class='muted' id='hdr'></div>");
 
-  html += F("<div class='row'>");
-  html += F("<form method='POST' action='/settings' style='display:inline'>");
-  html += F("<label><input type='checkbox' name='only_unk' value='1'");
-  if (g_showOnlyUnknown) html += F(" checked");
-  html += F("> Zobrazovat jen <b>UNKNOWN</b></label> ");
-  html += F(" &nbsp; TX pin: <input type='number' name='tx_pin' min='0' max='19' value='"); html += String(g_irTxPin); html += F("' style='width:70px'>");
-  html += F(" <button class='btn' type='submit'>Uložit</button>");
-  html += F("</form> &nbsp; ");
-  html += F("<a class='btn' href='/learn'>Učit kód</a> ");
-  html += F("<a class='btn' href='/learned'>Naučené kódy</a> ");
-  html += F("<a class='btn' href='/api/history'>API /history</a> ");
-  html += F("<a class='btn' href='/api/learned'>API /learned</a>");
-  html += F("</div>");
-
-  html += F("<h2 style='font-size:16px;margin:16px 0 8px'>Posledních 10 kódů</h2>");
-  html += F("<table><thead><tr>"
-            "<th>#</th><th>čas [ms]</th><th>protokol</th><th>bits</th>"
-            "<th>addr</th><th>cmd</th><th>value</th><th>flags</th><th>Akce</th></tr></thead><tbody>");
-
-  size_t shown = 0;
-  for (size_t i = 0; i < histCount; i++) {
-    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
-    const IREvent &e = history[idx];
-    const LearnedCode *learned = getLearnedByIndex(e.learnedIndex);
-    if (g_showOnlyUnknown && !isEffectivelyUnknown(e)) continue;
-
-    html += F("<tr><td>");
-    html += ++shown;
-    html += F("</td><td>");
-    html += e.ms;
-    html += F("</td><td>");
-    if (learned && learned->proto.length()) html += learned->proto;
-    else html += String(protoName(e.proto));
-    html += F("</td><td>");
-    html += static_cast<uint32_t>(e.bits);
-    html += F("</td><td><code>0x");
-    html += String(e.address, HEX);
-    html += F("</code></td><td><code>0x");
-    html += String(e.command, HEX);
-    html += F("</code></td><td><code>0x");
-    html += String(e.value, HEX);
-    html += F("</code></td><td>");
-    html += e.flags;
-    html += F("</td><td>");
-
-    if (isEffectivelyUnknown(e)) {
-      html += F("<button class='btn' onclick=\"openLearn(");
-      html += static_cast<uint32_t>(e.value);   html += F(",");
-      html += static_cast<uint32_t>(e.bits);    html += F(",");
-      html += static_cast<uint32_t>(e.address); html += F(",");
-      html += static_cast<uint32_t>(e.flags);   html += F(",");
-      html += '\'';
-      if (learned && learned->proto.length()) html += learned->proto;
-      else                                    html += String(protoName(e.proto));
-      html += F("'");
-      html += F(")\">Učit</button>");
-    } else if (learned) {
-      html += F("<span class='muted'>");
-      if (learned->function.length()) html += learned->function;
-      else html += F("Naučený kód");
-      if (learned->vendor.length()) { html += F(" ("); html += learned->vendor; html += F(")"); }
-      html += F("</span>");
-    } else {
-      html += F("<span class='muted'>—</span>");
-    }
-
-    html += F("</td></tr>");
-  }
-
-  if (shown == 0) {
-    html += F("<tr><td colspan='9' class='muted'>Žádné položky k zobrazení…</td></tr>");
-  }
-  html += F("</tbody></table>");
-
-  html += F("<p class='muted' style='margin-top:12px'>Tip: S volbou „jen UNKNOWN“ snadno odfiltruješ známé protokoly a zaměříš se na učení.</p>");
-
-  // --- Modal a JS (inline) ---
+  // Ovládací řádek (AJAX /settings)
   html += F(
-    "<div id='learnModal' style='position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)'>"
-      "<div style='background:#fff;padding:16px 16px 12px;border-radius:10px;min-width:300px;max-width:90vw'>"
-        "<h3 style='margin:0 0 8px;font-size:16px'>Učit kód</h3>"
-        "<form id='learnForm'>"
-          "<input type='hidden' name='value'><input type='hidden' name='bits'>"
-          "<input type='hidden' name='addr'><input type='hidden' name='flags'>"
-          "<input type='hidden' name='proto'>"
-          "<label>Výrobce:</label><input type='text' name='vendor' placeholder='např. Toshiba' required>"
-          "<label>Funkce:</label><input type='text' name='function' placeholder='např. Power, TempUp' required>"
-          "<label>Ovladač (volitelné):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
-          "<div style='margin-top:10px;display:flex;gap:8px;justify-content:flex-end'>"
-            "<button type='button' class='btn' id='cancelBtn'>Zrušit</button>"
-            "<button type='submit' class='btn'>Uložit</button>"
-          "</div>"
-        "</form>"
-      "</div>"
+    "<div class='row'>"
+      "<label><input id='onlyUnk' type='checkbox'> Jen <b>UNKNOWN</b></label>"
+      "<span style='margin-left:12px'>TX pin: <input id='txPin' type='number' min='0' max='19'></span>"
+      "<button id='saveBtn' class='btn'>Uložit</button>"
+      "<a class='btn' href='/learn'>Učit kód</a>"
+      "<a class='btn' href='/learned'>Naučené kódy</a>"
+      "<a class='btn' href='/api/history'>API /history</a>"
+      "<a class='btn' href='/api/learned'>API /learned</a>"
     "</div>"
+  );
+
+  // Tabulka
+  html += F(
+    "<h2 style='font-size:16px;margin:16px 0 8px'>Posledních 10 kódů</h2>"
+    "<table><thead><tr>"
+    "<th>#</th><th>čas [ms]</th><th>protokol</th><th>bits</th>"
+    "<th>addr</th><th>cmd</th><th>value</th><th>flags</th><th>Akce</th>"
+    "</tr></thead><tbody id='tb'></tbody></table>"
+    "<p class='muted' style='margin-top:12px'>Tip: S volbou „jen UNKNOWN“ snadno odfiltruješ známé protokoly a zaměříš se na učení.</p>"
+  );
+
+  // Modal „Učit“ + skripty
+  html += F(
+    "<div id='learnModal'><div class='card'>"
+      "<h3 style='margin:0 0 8px;font-size:16px'>Učit kód</h3>"
+      "<form id='learnForm'>"
+        "<input type='hidden' name='value'><input type='hidden' name='bits'>"
+        "<input type='hidden' name='addr'><input type='hidden' name='flags'>"
+        "<input type='hidden' name='proto'>"
+        "<label>Výrobce:</label><input type='text' name='vendor' placeholder='např. Toshiba' required>"
+        "<label>Funkce:</label><input type='text' name='function' placeholder='např. Power, TempUp' required>"
+        "<label>Ovladač (volit.):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
+        "<div style='margin-top:10px;display:flex;gap:8px;justify-content:flex-end'>"
+          "<button type='button' class='btn' id='cancelBtn'>Zrušit</button>"
+          "<button type='submit' class='btn' id='saveLearn'>Uložit</button>"
+        "</div>"
+      "</form>"
+    "</div></div>"
+    "<div id='toast'></div>"
     "<script>"
+    "const hdr=document.getElementById('hdr');"
+    "const tb=document.getElementById('tb');"
+    "const toast=document.getElementById('toast');"
+    "const onlyUnk=document.getElementById('onlyUnk');"
+    "const txPin=document.getElementById('txPin');"
+    "const saveBtn=document.getElementById('saveBtn');"
     "const modal=document.getElementById('learnModal');"
     "const form=document.getElementById('learnForm');"
     "const cancelBtn=document.getElementById('cancelBtn');"
-    "function openLearn(value,bits,addr,flags,proto){"
-      "form.value.value=value; form.bits.value=bits; form.addr.value=addr; form.flags.value=flags; form.proto.value=proto;"
-      "modal.style.display='flex';"
-    "}"
+    "let state={onlyUnknown:false,tx:0};"
+    "function showToast(msg,ok=true){toast.textContent=msg;toast.className=ok?'ok':'err';toast.style.display='block';setTimeout(()=>toast.style.display='none',2000)}"
+    "function toHex(n){return '0x'+(Number(n)>>>0).toString(16).toUpperCase()}"
+    "function openLearn(v,b,a,f,p){form.value.value=v;form.bits.value=b;form.addr.value=a;form.flags.value=f;form.proto.value=p;modal.style.display='flex'}"
     "cancelBtn.onclick=()=>{modal.style.display='none'};"
-    "form.onsubmit=async (e)=>{"
-      "e.preventDefault();"
+    "modal.addEventListener('click',e=>{if(e.target===modal)modal.style.display='none'});"
+
+    // Uložení learned
+    "form.onsubmit=async e=>{e.preventDefault();"
+      "document.getElementById('saveLearn').disabled=true;"
       "const fd=new FormData(form);"
-      "const params=new URLSearchParams(fd);"
-      "try{"
-        "const r=await fetch('/api/learn_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params});"
-        "const j=await r.json();"
-        "if(j.ok){ alert('Uloženo.'); modal.style.display='none'; location.reload(); }"
-        "else{ alert('Uložení selhalo.'); }"
-      "}catch(err){ alert('Chyba připojení.'); }"
+      "const body=new URLSearchParams(fd);"
+      "try{const r=await fetch('/api/learn_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});"
+           "const j=await r.json();"
+           "if(j.ok){showToast('Uloženo.');modal.style.display='none';loadHistory();}"
+           "else{showToast(j.err||'Uložení selhalo',false)}"
+      "}catch(err){showToast('Chyba připojení',false)}"
+      "document.getElementById('saveLearn').disabled=false;"
+    "};"
+
+    // Načtení historie
+    "async function loadHistory(){"
+      "try{const r=await fetch('/api/history'); const j=await r.json();"
+          "hdr.textContent='IP: '+j.ip+'  |  RSSI: '+j.rssi+' dBm';"
+          "onlyUnk.checked = !!j.only_unknown;"
+          "tb.innerHTML='';"
+          "let shown=0;"
+          "j.history.forEach((e,idx)=>{"
+            "if(onlyUnk.checked && !e.proto.includes('UNKNOWN') && !(!e.learned && e.proto==='UNKNOWN')) return;"
+            "shown++;"
+            "const tr=document.createElement('tr');"
+            "function td(t){const x=document.createElement('td');x.textContent=t;tr.appendChild(x)}"
+            "td(shown); td(e.ms); td(e.learned_proto||e.proto); td(e.bits);"
+            "td(toHex(e.addr)); td(toHex(e.cmd)); td(toHex(e.value)); td(e.flags);"
+            "const act=document.createElement('td');"
+            "if(e.proto.includes('UNKNOWN')||(!e.learned&&e.learned_proto==='')){"
+              "const b=document.createElement('button');b.className='btn';b.textContent='Učit';"
+              "b.onclick=()=>openLearn(e.value,e.bits,e.addr,e.flags,(e.learned_proto||e.proto));"
+              "act.appendChild(b);"
+            "}else{"
+              "const span=document.createElement('span');span.className='muted';"
+              "span.textContent = (e.learned_function||'Naučený kód') + (e.learned_vendor?(' ('+e.learned_vendor+')'):'');"
+              "act.appendChild(span);"
+            "}"
+            "tr.appendChild(act); tb.appendChild(tr);"
+          "});"
+          "if(shown===0){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=9;td.className='muted';td.textContent='Žádné položky k zobrazení…';tr.appendChild(td);tb.appendChild(tr)}"
+      "}catch(err){/* noop */}"
     "}"
-    "</script>"
+
+    // Uložení nastavení bez reloadu
+    "saveBtn.onclick=async()=>{"
+      "saveBtn.disabled=true;"
+      "try{const p=new URLSearchParams();"
+          "p.set('only_unk',onlyUnk.checked?'1':'0');"
+          "if(txPin.value!=='') p.set('tx_pin',txPin.value);"
+          "const r=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});"
+          "if(r.status===302||r.ok){showToast('Nastavení uloženo'); loadHistory();}"
+          "else showToast('Uložení nastavení selhalo',false);"
+      "}catch(e){showToast('Chyba připojení',false)}"
+      "saveBtn.disabled=false;"
+    "};"
+
+    // Init – načti historii a z API /history nahraj current TX pin/flag (přijdou nepřímo: only_unknown už je tam)
+    "document.addEventListener('DOMContentLoaded',()=>{loadHistory(); setInterval(loadHistory,2000);});"
   );
+
+  // Předvyplň aktuální hodnoty (serverem vložené)
+  html += F("</script>");
 
   html += F("</body></html>");
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// === /settings (POST) ===
+// === /settings (POST) – zachováno, nyní voláno AJAXem ===
 inline void handleSettingsPost() {
   bool only = (server.hasArg("only_unk") && server.arg("only_unk") == "1");
   g_showOnlyUnknown = only;
@@ -167,13 +196,15 @@ inline void handleSettingsPost() {
       }
     }
   }
+
+  // Pro kompatibilitu se stávajícím kódem necháme 302 (AJAX to zvládne)
   server.sendHeader("Location", "/");
   server.send(302);
 }
 
-// === /api/history ===
+// === /api/history (GET) – beze změn ve struktuře ===
 inline void handleJsonHistory() {
-  String out; out.reserve(2048);
+  String out; out.reserve(3072);
   out += F("{\"ip\":\""); out += WiFi.localIP().toString();
   out += F("\",\"rssi\":"); out += WiFi.RSSI();
   out += F(",\"only_unknown\":"); out += g_showOnlyUnknown ? "true" : "false";
@@ -206,22 +237,17 @@ inline void handleJsonHistory() {
   server.send(200, "application/json", out);
 }
 
-// === /learn (GET) a /learn_save (POST) – stránka pro poslední UNKNOWN ===
+// === /learn (GET) – informativní stránka pro poslední UNKNOWN ===
 inline void handleLearnPage() {
   String html; html.reserve(4000);
   html += F(
     "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Učení kódu (UNKNOWN)</title>"
-    "<style>"
-    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
+    "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
     "label{display:block;margin:6px 0 2px}"
     "input[type=text]{width:100%;max-width:420px;padding:6px 8px}"
-    "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
-    "button{padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa}"
-    ".muted{color:#666}"
-    "</style></head><body>"
-    "<h1>Učení kódu (UNKNOWN)</h1>"
+    ".muted{color:#666}</style></head><body><h1>Učení kódu (UNKNOWN)</h1>"
   );
   if (!hasLastUnknown) {
     html += F("<p class='muted'>Zatím nebyl zachycen žádný validní kód typu <b>UNKNOWN</b>. "
@@ -229,7 +255,6 @@ inline void handleLearnPage() {
     server.send(200, "text/html; charset=utf-8", html);
     return;
   }
-
   html += F("<p>Poslední UNKNOWN zachycený kód:</p><ul>");
   html += F("<li>bits: ");   html += static_cast<uint32_t>(lastUnknown.bits); html += F("</li>");
   html += F("<li>addr: <code>0x"); html += String(lastUnknown.address, HEX); html += F("</code></li>");
@@ -254,6 +279,7 @@ inline void handleLearnPage() {
   server.send(200, "text/html; charset=utf-8", html);
 }
 
+// === /learn_save (POST) – stránka „Učit“ (UNKNOWN) – nová verze ===
 inline void handleLearnSave() {
   if (!hasLastUnknown) { server.sendHeader("Location", "/learn"); server.send(302); return; }
 
@@ -262,40 +288,43 @@ inline void handleLearnSave() {
   String remoteLabel = server.hasArg("remote_label") ? server.arg("remote_label") : "";
 
   vendor.trim(); protoLabel.trim(); remoteLabel.trim();
+  if (!vendor.length() || !protoLabel.length() || !remoteLabel.length()) {
+    server.send(400, "text/plain", "Missing fields");
+    return;
+  }
 
-  bool ok = (vendor.length() && protoLabel.length() && remoteLabel.length()) &&
-          fsAppendLearned(lastUnknown.value,
-                          lastUnknown.bits,
-                          lastUnknown.address,
-                          lastUnknown.flags,
-                          String("UNKNOWN"),
-                          vendor,
-                          protoLabel,
-                          remoteLabel);
+  // Ukládáme vždy jako "UNKNOWN" (z pohledu dekodéru); UI label si neseš v protoLabel parametru – ten už máš ve storage jako string 'proto'
+  bool ok = fsAppendLearned(lastUnknown.value, lastUnknown.bits, lastUnknown.address, lastUnknown.flags,
+                            String("UNKNOWN"), vendor, protoLabel, remoteLabel);
 
-  String html; html.reserve(1200);
+  if (ok && g_lastRawValid) {
+    size_t idx = getLearnedCount() ? (getLearnedCount() - 1) : 0;
+    fsSaveRawForIndex(idx, g_lastRaw.data(), (uint16_t)g_lastRaw.size(), g_lastRawKhz);
+  }
+
+  String html;
   html += F("<!doctype html><html><meta charset='utf-8'><title>Uloženo</title><body>");
-  html += ok ? F("<p>✅ Kód uložen.</p>") : F("<p>❌ Uložení selhalo.</p>");
+  html += ok ? F("<p>✅ Kód uložen (včetně RAW, je-li k dispozici).</p>") : F("<p>❌ Uložení selhalo.</p>");
   html += F("<p><a href='/learn'>← Zpět na učení</a> &nbsp; <a href='/learned'>Naučené kódy</a> &nbsp; <a href='/'>Domů</a></p>");
   html += F("</body></html>");
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// === /learned (GET) – tabulka naučených + JS editor + ODESLAT ===
+// === /learned (GET) – tabulka naučených + inline editor + ODESLAT (repeat) ===
 inline void handleLearnedList() {
   String data = fsReadLearnedAsArrayJSON();
-  String html; html.reserve(8000);
+  String html; html.reserve(9000);
   html += F(
     "<!doctype html><html lang='cs'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Naučené kódy</title>"
     "<style>"
     "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px}"
-    "table{border-collapse:collapse;width:100%;max-width:980px}"
+    "table{border-collapse:collapse;width:100%;max-width:1100px}"
     "th,td{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}"
     "th{background:#f5f5f5}"
     "code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}"
-    "a.btn,button.btn{display:inline-block;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa;text-decoration:none;color:#222}"
+    ".btn{display:inline-block;padding:6px 10px;border-radius:8px;border:1px solid #bbb;background:#fafafa;text-decoration:none;color:#222}"
     "#editModal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)}"
     "#editModal .card{background:#fff;padding:16px 16px 12px;border-radius:10px;min-width:320px;max-width:90vw}"
     "#editModal label{display:block;margin:6px 0 2px;font-size:14px}"
@@ -314,7 +343,7 @@ inline void handleLearnedList() {
         "<label>Protokol:</label><input type='text' name='proto' placeholder='např. NEC' required>"
         "<label>Výrobce:</label><input type='text' name='vendor' placeholder='např. Toshiba' required>"
         "<label>Funkce:</label><input type='text' name='function' placeholder='např. Power, TempUp' required>"
-        "<label>Ovladač (volitelné):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
+        "<label>Ovladač (volit.):</label><input type='text' name='remote_label' placeholder='např. Klima Obývák'>"
         "<div style='margin-top:10px;display:flex;gap:8px;justify-content:flex-end'>"
           "<button type='button' class='btn' id='editCancel'>Zrušit</button>"
           "<button type='submit' class='btn'>Uložit</button>"
@@ -331,73 +360,37 @@ inline void handleLearnedList() {
     "const cancelBtn=document.getElementById('editCancel');"
     "const idxInput=form.querySelector('input[name=index]');"
     "function toHex(num){return '0x'+((num>>>0).toString(16).toUpperCase());}"
-    "function openEdit(idx,obj){"
-      "idxInput.value=idx;"
-      "form.proto.value=obj.proto||'UNKNOWN';"
-      "form.vendor.value=obj.vendor||'';"
-      "form.function.value=obj.function||'';"
-      "form.remote_label.value=obj.remote_label||'';"
-      "modal.style.display='flex';"
-    "}"
-    "cancelBtn.onclick=()=>{modal.style.display='none';};"
-    "modal.addEventListener('click',e=>{if(e.target===modal){modal.style.display='none';}});"
-    "form.onsubmit=async(e)=>{"
-      "e.preventDefault();"
-      "const fd=new FormData(form);"
-      "const params=new URLSearchParams(fd);"
-      "try{"
-        "const r=await fetch('/api/learn_update',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params});"
-        "const j=await r.json();"
-        "if(j.ok){alert('Uloženo.');modal.style.display='none';location.reload();}"
-        "else{alert('Uložení selhalo.');}"
-      "}catch(err){alert('Chyba připojení.');}"
-    "};"
-    "data.forEach((o,i)=>{"
-      "const tr=document.createElement('tr');"
-      "function addCell(text){const td=document.createElement('td');td.textContent=text;tr.appendChild(td);}"
-      "addCell(i+1);"
-      "addCell(o.vendor||'');"
-      "addCell(o.proto||'UNKNOWN');"
-      "addCell(o.function||'');"
-      "addCell(o.remote_label||'');"
-      "addCell(o.bits||0);"
-      "addCell(toHex(o.addr||0));"
-      "addCell(toHex(o.value||0));"
-      "addCell(o.flags||0);"
-      "const actionTd=document.createElement('td');"
-      "const btn=document.createElement('button');"
-      "btn.type='button';"
-      "btn.textContent='Upravit';"
-      "btn.className='btn';"
-      "btn.onclick=()=>openEdit(i,o);"
-      "actionTd.appendChild(btn);"
-      "const sbtn=document.createElement('button');"
-      "sbtn.type='button'; sbtn.textContent='Odeslat'; sbtn.className='btn'; sbtn.style.marginLeft='6px';"
-      "sbtn.onclick=async function(){"
-        "try{"
-          "const r=await fetch('/api/send?index='+i);"
-          "const j=await r.json();"
-          "if(!j.ok) alert('Odeslání selhalo: '+(j.err||r.status));"
-        "}catch(e){ alert('Chyba odeslání: '+e); }"
-      "};"
-      "actionTd.appendChild(sbtn);"
-      "tr.appendChild(actionTd);"
-      "tb.appendChild(tr);"
+    "function openEdit(idx,obj){idxInput.value=idx;form.proto.value=obj.proto||'UNKNOWN';form.vendor.value=obj.vendor||'';form.function.value=obj.function||'';form.remote_label.value=obj.remote_label||'';modal.style.display='flex'}"
+    "cancelBtn.onclick=()=>{modal.style.display='none'};"
+    "modal.addEventListener('click',e=>{if(e.target===modal){modal.style.display='none'}});"
+    "form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const params=new URLSearchParams(fd);try{const r=await fetch('/api/learn_update',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params});const j=await r.json();if(j.ok){alert('Uloženo.');modal.style.display='none';location.reload();}else{alert('Uložení selhalo.');}}catch(err){alert('Chyba připojení.');}};"
+    "data.forEach((o,i)=>{const tr=document.createElement('tr');"
+      "function cell(t){const td=document.createElement('td');td.textContent=t;tr.appendChild(td)}"
+      "cell(i+1); cell(o.vendor||''); cell(o.proto||'UNKNOWN'); cell(o.function||''); cell(o.remote_label||'');"
+      "cell(o.bits||0); cell(toHex(o.addr||0)); cell(toHex(o.value||0)); cell(o.flags||0);"
+      "const act=document.createElement('td');"
+      "const edit=document.createElement('button'); edit.className='btn'; edit.textContent='Upravit'; edit.onclick=()=>openEdit(i,o); act.appendChild(edit);"
+      // Odeslat s repeat volbou
+      "const sbtn=document.createElement('button'); sbtn.className='btn'; sbtn.textContent='Odeslat'; sbtn.style.marginLeft='6px';"
+      "const rep=document.createElement('input'); rep.type='number'; rep.min=0; rep.max=3; rep.value=0; rep.title='repeat'; rep.style.width='56px'; rep.style.marginLeft='6px';"
+      "sbtn.onclick=async()=>{try{const r=await fetch('/api/send?index='+i+'&repeat='+rep.value); const j=await r.json(); if(!j.ok) alert('Odeslání selhalo: '+(j.err||'error'));}catch(e){alert('Chyba odeslání: '+e);}};"
+      "act.appendChild(sbtn); act.appendChild(rep); tr.appendChild(act); tb.appendChild(tr);"
     "});"
     "</script></body></html>"
   );
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// === /api/learned (GET) ===
+// === /api/learned (GET) – JSON list ===
 inline void handleApiLearned() {
   server.send(200, "application/json", fsReadLearnedAsArrayJSON());
 }
 
-// === /api/learn_save (POST) – přímé uložení z hlavní stránky ===
+// === /api/learn_save (POST) – povolí i UNKNOWN, nic neblokuje
 inline void handleApiLearnSave() {
   auto need = [&](const char* k){ return server.hasArg(k) && server.arg(k).length() > 0; };
-  if (!(need("value") && need("bits") && need("addr") && need("flags") && need("proto") && need("vendor") && need("function"))) {
+  if (!(need("value") && need("bits") && need("addr") && need("flags")
+        && need("proto") && need("vendor") && need("function"))) {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing params\"}");
     return;
   }
@@ -407,41 +400,35 @@ inline void handleApiLearnSave() {
   uint32_t addr  = (uint32_t) strtoul(server.arg("addr").c_str(),   nullptr, 10);
   uint32_t flags = (uint32_t) strtoul(server.arg("flags").c_str(),  nullptr, 10);
 
-  String proto = server.arg("proto"); proto.trim();
-  decode_type_t p = parseProtoLabel(proto);
-  if (p == UNKNOWN) {
-    server.send(400, "application/json", "{\"ok\":false,\"err\":\"unsupported proto label\"}");
-    return;
-  }
-  String vendor  = server.arg("vendor");       vendor.trim();
-  String func    = server.arg("function");     func.trim();
-  String remote  = server.hasArg("remote_label") ? server.arg("remote_label") : "";
+  String proto  = server.arg("proto");   proto.trim();   // může být "UNKNOWN"
+  String vendor = server.arg("vendor");  vendor.trim();
+  String func   = server.arg("function");func.trim();
+  String remote = server.hasArg("remote_label") ? server.arg("remote_label") : "";
   remote.trim();
 
   bool ok = fsAppendLearned(value, bits, addr, flags, proto, vendor, func, remote);
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-// === /api/learn_update (POST) – update metadat položky ===
+
+// === /api/learn_update (POST) – update metadat ===
 inline void handleApiLearnUpdate() {
   auto need = [&](const char* k){ return server.hasArg(k) && server.arg(k).length() > 0; };
   if (!need("index") || !need("proto") || !need("vendor") || !need("function")) {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing params\"}");
     return;
   }
-
   size_t index = static_cast<size_t>(strtoul(server.arg("index").c_str(), nullptr, 10));
   String proto  = server.arg("proto");        proto.trim();
   String vendor = server.arg("vendor");       vendor.trim();
   String func   = server.arg("function");     func.trim();
-  String remote = server.hasArg("remote_label") ? server.arg("remote_label") : "";
-  remote.trim();
-
+  String remote = server.hasArg("remote_label") ? server.arg("remote_label") : ""; remote.trim();
   bool ok = fsUpdateLearned(index, proto, vendor, func, remote);
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-// === /api/send (GET) – odeslání vybraného naučeného kódu ===
+// === /api/send (GET) – odeslání naučeného kódu (support repeat) ===
+// === /api/send (GET) – odeslání naučeného kódu (nová verze) ===
 inline void handleApiSend() {
   if (!server.hasArg("index")) {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing index\"}");
@@ -454,20 +441,12 @@ inline void handleApiSend() {
     if (r < 0) r = 0; if (r > 3) r = 3; reps = (uint8_t)r;
   }
 
-  const LearnedCode* e = getLearnedByIndex(idx);
-  if (!e) {
-    server.send(404, "application/json", "{\"ok\":false,\"err\":\"index out of range\"}");
-    return;
-  }
-
-  const bool ok = irSendLearned(*e, reps);
+  const bool ok = irSendLearnedByIndex(idx, reps);
   if (ok) { server.send(200, "application/json", "{\"ok\":true}"); return; }
 
-  String why = "unsupported protocol";
-  if (parseProtoLabel(e->proto) == UNKNOWN) why = "proto UNKNOWN or not mapped";
-  String resp = String("{\"ok\":false,\"err\":\"") + why + "\"}";
-  server.send(501, "application/json", resp);
+  server.send(501, "application/json", "{\"ok\":false,\"err\":\"no mapped proto and no RAW\"}");
 }
+
 
 // ====== Router a běh webu ======
 inline void startWebServer() {
@@ -492,4 +471,3 @@ inline void serviceClient() {
   server.handleClient();
   delay(1);
 }
-
