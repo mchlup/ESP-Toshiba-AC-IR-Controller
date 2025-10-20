@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <ctype.h>
 #include <algorithm>
+#include "ToshibaAC.h"
 
 // ======================== Datové typy a pomocné struktury ========================
 
@@ -64,6 +65,8 @@ struct LearnedLineDetails {
 WebServer server(80);
 static const int8_t IR_TX_PIN_DEFAULT = 0;   // ESP32-C3: např. 0 (přizpůsob dle zapojení)
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
+static const uint8_t IR_TX_PIN = 4;   // uprav dle zapojení
+ToshibaACIR toshiba(IR_TX_PIN);
 static const uint8_t IR_RX_PIN = 10;         // ESP32-C3: ověřené 4/5/10
 static const uint32_t DUP_FILTER_MS = 120;
 Preferences prefs;                 // NVS namespace: "irrecv"
@@ -1255,6 +1258,7 @@ void setup() {
 
   wifiSetupWithWiFiManager();
   startWebServer();
+  toshiba.begin();
 
   // IR přijímač
   IrReceiver.begin(IR_RX_PIN, DISABLE_LED_FEEDBACK);
