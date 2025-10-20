@@ -1,3 +1,4 @@
+#define USE_IRREMOTE_HPP_AS_PLAIN_INCLUDE
 #include "ToshibaAC.h"
 
 // Globální instance deklarovaná v hlavním .ino souboru.
