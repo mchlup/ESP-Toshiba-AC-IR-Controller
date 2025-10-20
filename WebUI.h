@@ -21,6 +21,8 @@
 // - extern String fsReadLearnedAsArrayJSON();
 // - extern bool fsUpdateLearned(size_t index, const String& proto, const String& vendor, const String& function, const String& remote);
 // - extern bool irSendLearned(const LearnedCode &e, uint8_t repeats);
+// - extern bool fsDeleteLearned(size_t index);
+// - extern bool irSendEvent(const IREvent &ev, uint8_t repeats);
 // - extern decode_type_t parseProtoLabel(const String&);
 // - extern void initIrSender(int8_t txPin);
 
@@ -141,12 +143,15 @@ inline void handleRoot() {
             "td(shown); td(e.ms); td(e.learned_proto||e.proto); td(e.bits);"
             "td(toHex(e.addr)); td(toHex(e.cmd)); td(toHex(e.value)); td(e.flags);"
             "const act=document.createElement('td');"
+            "const sendBtn=document.createElement('button');sendBtn.className='btn';sendBtn.textContent='Odeslat';"
+            "sendBtn.onclick=async()=>{sendBtn.disabled=true;try{const r=await fetch('/api/history_send?ms='+e.ms);const j=await r.json();if(j.ok){showToast('Odesláno.');}else{showToast(j.err||'Odeslání selhalo',false);}}catch(err){showToast('Chyba odeslání',false);}sendBtn.disabled=false;};"
+            "act.appendChild(sendBtn);"
             "if(e.proto.includes('UNKNOWN')||(!e.learned&&e.learned_proto==='')){"
-              "const b=document.createElement('button');b.className='btn';b.textContent='Učit';"
+              "const b=document.createElement('button');b.className='btn';b.textContent='Učit';b.style.marginLeft='6px';"
               "b.onclick=()=>openLearn(e.value,e.bits,e.addr,e.flags,(e.learned_proto||e.proto));"
               "act.appendChild(b);"
             "}else{"
-              "const span=document.createElement('span');span.className='muted';"
+              "const span=document.createElement('span');span.className='muted';span.style.marginLeft='6px';"
               "span.textContent = (e.learned_function||'Naučený kód') + (e.learned_vendor?(' ('+e.learned_vendor+')'):'');"
               "act.appendChild(span);"
             "}"
@@ -374,7 +379,10 @@ inline void handleLearnedList() {
       "const sbtn=document.createElement('button'); sbtn.className='btn'; sbtn.textContent='Odeslat'; sbtn.style.marginLeft='6px';"
       "const rep=document.createElement('input'); rep.type='number'; rep.min=0; rep.max=3; rep.value=0; rep.title='repeat'; rep.style.width='56px'; rep.style.marginLeft='6px';"
       "sbtn.onclick=async()=>{try{const r=await fetch('/api/send?index='+i+'&repeat='+rep.value); const j=await r.json(); if(!j.ok) alert('Odeslání selhalo: '+(j.err||'error'));}catch(e){alert('Chyba odeslání: '+e);}};"
-      "act.appendChild(sbtn); act.appendChild(rep); tr.appendChild(act); tb.appendChild(tr);"
+      "act.appendChild(sbtn); act.appendChild(rep);"
+      "const del=document.createElement('button'); del.className='btn'; del.textContent='Smazat'; del.style.marginLeft='6px';"
+      "del.onclick=async()=>{if(!confirm('Smazat tento kód?')) return; const params=new URLSearchParams(); params.set('index',i); try{const r=await fetch('/api/learn_delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params}); const j=await r.json(); if(j.ok){alert('Smazáno.'); location.reload();}else{alert('Smazání selhalo.');}}catch(err){alert('Chyba smazání.');}};"
+      "act.appendChild(del); tr.appendChild(act); tb.appendChild(tr);"
     "});"
     "</script></body></html>"
   );
@@ -427,6 +435,16 @@ inline void handleApiLearnUpdate() {
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
+inline void handleApiLearnDelete() {
+  if (!server.hasArg("index")) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing index\"}");
+    return;
+  }
+  size_t index = static_cast<size_t>(strtoul(server.arg("index").c_str(), nullptr, 10));
+  bool ok = fsDeleteLearned(index);
+  server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
 // === /api/send (GET) – odeslání naučeného kódu (support repeat) ===
 // === /api/send (GET) – odeslání naučeného kódu (nová verze) ===
 inline void handleApiSend() {
@@ -447,6 +465,39 @@ inline void handleApiSend() {
   server.send(501, "application/json", "{\"ok\":false,\"err\":\"no mapped proto and no RAW\"}");
 }
 
+inline void handleApiHistorySend() {
+  if (!server.hasArg("ms")) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing ms\"}");
+    return;
+  }
+  uint32_t targetMs = static_cast<uint32_t>(strtoul(server.arg("ms").c_str(), nullptr, 10));
+  uint8_t repeats = 0;
+  if (server.hasArg("repeat")) {
+    long r = strtol(server.arg("repeat").c_str(), nullptr, 10);
+    if (r < 0) r = 0;
+    if (r > 3) r = 3;
+    repeats = static_cast<uint8_t>(r);
+  }
+
+  const IREvent* match = nullptr;
+  for (size_t i = 0; i < histCount; ++i) {
+    size_t idx = (histWrite + HISTORY_LEN - 1 - i) % HISTORY_LEN;
+    const IREvent &ev = history[idx];
+    if (ev.ms == targetMs) {
+      match = &ev;
+      break;
+    }
+  }
+
+  if (!match) {
+    server.send(404, "application/json", "{\"ok\":false,\"err\":\"not found\"}");
+    return;
+  }
+
+  bool ok = irSendEvent(*match, repeats);
+  server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"send failed\"}");
+}
+
 
 // ====== Router a běh webu ======
 inline void startWebServer() {
@@ -461,7 +512,9 @@ inline void startWebServer() {
   server.on("/api/learned", handleApiLearned);
   server.on("/api/learn_save", HTTP_POST, handleApiLearnSave);
   server.on("/api/learn_update", HTTP_POST, handleApiLearnUpdate);
+  server.on("/api/learn_delete", HTTP_POST, handleApiLearnDelete);
   server.on("/api/send", handleApiSend);
+  server.on("/api/history_send", handleApiHistorySend);
 
   server.begin();
   Serial.println(F("[NET] WebServer běží na portu 80"));
