@@ -59,24 +59,67 @@ struct LearnedLineDetails {
 };
 
 // ======================== Globální proměnné ========================
-
 WebServer server(80);
-
 static const int8_t IR_TX_PIN_DEFAULT = 0;   // ESP32-C3: např. 0 (přizpůsob dle zapojení)
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_RX_PIN = 10;         // ESP32-C3: ověřené 4/5/10
-
 static const uint32_t DUP_FILTER_MS = 120;
-
 Preferences prefs;                 // NVS namespace: "irrecv"
 static const char* LEARN_FILE = "/learned.jsonl";
 static bool g_showOnlyUnknown = false;
-
-// Historie posledních zachycených rámců
 static const size_t HISTORY_LEN = 10;
 static IREvent history[HISTORY_LEN];
 static size_t histWrite = 0;
 static size_t histCount = 0;
+static std::vector<uint16_t> g_lastRaw;
+static uint8_t  g_lastRawKhz = 38;   // default
+static bool     g_lastRawValid = false;
+
+// Soubor pro RAW: /learned/raw_<index>.bin  (binárně: [1B khz][2B len LE][2B*len pulzy])
+static String rawPathForIndex(size_t index) {
+  String p = F("/learned/raw_");
+  p += String(index);
+  p += F(".bin");
+  return p;
+}
+
+static bool fsSaveRawForIndex(size_t index, const uint16_t* buf, uint16_t len, uint8_t khz) {
+  File f = LittleFS.open(rawPathForIndex(index), "w");
+  if (!f) return false;
+  f.write(&khz, 1);
+  f.write((const uint8_t*)&len, 2);
+  f.write((const uint8_t*)buf, len * 2);
+  f.close();
+  return true;
+}
+
+static bool fsLoadRawForIndex(size_t index, std::vector<uint16_t> &out, uint8_t &khz) {
+  File f = LittleFS.open(rawPathForIndex(index), "r");
+  if (!f) return false;
+  uint8_t kh; uint16_t len;
+  if (f.read(&kh, 1) != 1) { f.close(); return false; }
+  if (f.read((uint8_t*)&len, 2) != 2) { f.close(); return false; }
+  out.resize(len);
+  size_t need = len * 2;
+  if (f.read((uint8_t*)out.data(), need) != need) { f.close(); return false; }
+  f.close();
+  khz = kh;
+  return true;
+}
+
+static bool fsHasRaw(size_t index) {
+  return LittleFS.exists(rawPathForIndex(index));
+}
+
+// Pokud tvá API vrstva nevrací index nově vložené položky, použij getLearnedCount()
+extern size_t getLearnedCount(); // doplň, nebo přepiš dle tvé implementace
+
+// Zavolej hned po IrReceiver.decode() úspěchu (tj. když máš vyplněné decodedIRData)
+static void snapshotLastRawFromReceiver() {
+  g_lastRawValid = false;
+  g_lastRaw.clear();
+  g_lastRawKhz = 38;
+}
 
 static void addToHistory(const IRData &d, int16_t learnedIndex) {
   IREvent e;
@@ -95,21 +138,89 @@ static void addToHistory(const IRData &d, int16_t learnedIndex) {
 
 static bool hasLastUnknown = false;
 static IREvent lastUnknown = {0, UNKNOWN, 0, 0, 0, 0, 0, -1};
-
 static uint32_t lastValue = 0;
 static decode_type_t lastProto = UNKNOWN;
 static uint8_t lastBits = 0;
 static uint32_t lastMs = 0;
-
-// RAW buffer (pokud je dodán ze souboru)
-static std::vector<uint16_t> g_lastRawMicros; // pouze informační; nevyužíváme pro učení teď
-static uint16_t g_lastFreqKHz = 38;
-static bool g_lastRawValid = false;
-
-// Cache naučených kódů
 static std::vector<LearnedCode> g_learnedCache;
 static std::unordered_map<LearnedKey, int16_t, LearnedKeyHash> g_learnedIndex;
 static bool g_learnedCacheValid = false;
+// ===== RAW sniffer (nezávislý na knihovně) =====
+// Vstup je výstup IR demodulátoru (obvykle invertovaný: idle=HIGH, MARK=LOW)
+static const uint16_t RAW_MAX_PULSES = 512;       // stačí pro AC rámce
+static const uint32_t RAW_FRAME_GAP_US = 15000;   // 15 ms = konec rámce
+
+volatile uint16_t g_isrPulses[RAW_MAX_PULSES];
+volatile uint16_t g_isrCount = 0;
+volatile uint32_t g_isrLastEdgeUs = 0;
+volatile int      g_isrLastLevel = -1;  // -1 = neumíme
+volatile bool     g_isrFrameReady = false;
+
+// Pomocné: bezpečné čtení micros v ISR/loop
+static inline uint32_t micros_safe() { return micros(); }
+
+// ISR: ukládá délky pulsů v µs mezi hranami
+void IRAM_ATTR irEdgeISR() {
+  const uint32_t now = micros_safe();
+  int lvl = digitalRead(IR_RX_PIN);    // na ESP32-C3 je to rychlé
+
+  if (g_isrLastLevel < 0) {
+    // první zachycení – inicializace
+    g_isrLastLevel = lvl;
+    g_isrLastEdgeUs = now;
+    g_isrCount = 0;
+    return;
+  }
+
+  uint32_t dur = now - g_isrLastEdgeUs;
+  g_isrLastEdgeUs = now;
+
+  if (g_isrCount < RAW_MAX_PULSES) {
+    // saturace na 16-bit
+    if (dur > 0xFFFF) dur = 0xFFFF;
+    g_isrPulses[g_isrCount++] = (uint16_t)dur;
+  } else {
+    // přetečeno – rámec už je moc dlouhý, příště se uzavře gapem
+  }
+
+  g_isrLastLevel = lvl;
+}
+
+// Služba pro loop(): uzavře rámec po mezeře a převede do g_lastRaw
+static void rawSnifferService() {
+  // Pokud proběhly hrany a dlouho žádná nebyla => máme hotový rámec
+  if (g_isrCount > 0 && !g_isrFrameReady) {
+    uint32_t gap = micros_safe() - g_isrLastEdgeUs;
+    if (gap > RAW_FRAME_GAP_US) {
+      // zkopíruj a připrav g_lastRaw jako střídající se MARK/SPACE (začneme MARK)
+      noInterrupts();
+      uint16_t n = g_isrCount;
+      static uint16_t tmp[RAW_MAX_PULSES];
+      for (uint16_t i = 0; i < n; i++) tmp[i] = g_isrPulses[i];
+      g_isrCount = 0;
+      g_isrLastLevel = -1;
+      interrupts();
+
+      // demodulátor: typicky první úsek je SPACE (idle HIGH → první hrana do LOW = začátek MARK)
+      // Chceme začít MARKem. Pokud by to nevycházelo, jen posuneme o 1.
+      // (Je to „best effort“ – demodulátor dělá thresholding. Pro sendRaw je to OK.)
+      g_lastRaw.clear();
+      g_lastRaw.reserve(n);
+      for (uint16_t i = 0; i < n; i++) g_lastRaw.push_back(tmp[i]);
+
+      // Heuristika: pokud je prvních pár µs podezřele krátkých (< 150 µs), sloučíme je
+      if (g_lastRaw.size() > 2 && g_lastRaw[0] < 150) {
+        g_lastRaw[1] = (uint16_t)std::min<uint32_t>(0xFFFF, (uint32_t)g_lastRaw[0] + g_lastRaw[1]);
+        g_lastRaw.erase(g_lastRaw.begin()); // zahodíme první
+      }
+
+      // Bez měření nosné – zůstaneme u 38 kHz (většina spotřební elektroniky)
+      g_lastRawKhz = 38;
+      g_lastRawValid = !g_lastRaw.empty();
+      g_isrFrameReady = true;  // jen pro debug; další hrana to zruší
+    }
+  }
+}
 
 // ======================== Deklarace funkcí ========================
 
@@ -189,22 +300,99 @@ const __FlashStringHelper* protoName(decode_type_t p) {
   }
 }
 
-static decode_type_t parseProtoLabel(const String &s) {
-  String u = s; u.toUpperCase();
-  if (u == "NEC") return NEC;
-  if (u == "NEC2") return NEC2;
-  if (u == "SONY") return SONY;
-  if (u == "RC5") return RC5;
-  if (u == "RC6") return RC6;
-  if (u == "PANASONIC") return PANASONIC;
-  if (u == "SAMSUNG") return SAMSUNG;
-  if (u == "JVC") return JVC;
-  if (u == "LG") return LG;
-  if (u == "KASEIKYO" || u == "PANASONIC_KASEIKYO") return KASEIKYO;
-  if (u == "APPLE") return APPLE;
-  if (u == "ONKYO") return ONKYO;
-  if (u == "TOSHIBA-AC" || u == "TOSHIBA") return NEC; // fallback
+// === Mapování label -> IRremote dekodér ===
+static decode_type_t parseProtoLabelRelaxed(const String &sIn) {
+  String s = sIn; s.trim(); s.toUpperCase();
+  if (s == F("NEC")) return NEC;
+  if (s == F("SONY")) return SONY;
+  if (s == F("RC5")) return RC5;
+  if (s == F("RC6")) return RC6;
+  if (s == F("SAMSUNG")) return SAMSUNG;
+  if (s == F("PANASONIC")) return PANASONIC;
+  if (s == F("JVC")) return JVC;
+  if (s == F("SHARP")) return SHARP;
+  if (s == F("LG")) return LG;
+  if (s == F("B&O") || s == F("BANGOLUFSEN")) return BANG_OLUFSEN;
+  // Přidej další podle potřeby…
   return UNKNOWN;
+}
+
+// === Core sender – zkus nativní protokol, jinak RAW ===
+static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
+                              const std::vector<uint16_t>* rawOpt = nullptr,
+                              uint8_t rawKhz = 38) {
+  const decode_type_t t = parseProtoLabelRelaxed(e.proto.length() ? e.proto : String(F("UNKNOWN")));
+
+  auto doRepeats = [&](auto &&fnOnce){
+    for (uint8_t r=0; r<=repeats; r++){ fnOnce(); delay(40); }
+    return true;
+  };
+
+  // 1) nativní protokoly (když je známý label)
+  switch (t) {
+    case NEC:       return doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, (int)e.bits); });
+    case SONY:      return doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); });
+    case RC5:       return doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, (int)e.bits); });
+    case RC6:       return doRepeats([&]{ IrSender.sendRC6((unsigned long)e.value, (int)e.bits); });
+    case JVC:       return doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, (int)e.bits, false); });
+    case LG:        return doRepeats([&]{ IrSender.sendLG((unsigned long)e.value, (int)e.bits); });
+    case SAMSUNG:   { uint16_t a=(e.addr)?(uint16_t)e.addr:(uint16_t)(e.value>>16);
+                      uint16_t c=(uint16_t)(e.value & 0xFFFF);
+                      return doRepeats([&]{ IrSender.sendSamsung(a,c,0); }); }
+    case PANASONIC: return doRepeats([&]{ IrSender.sendPanasonic((uint16_t)e.addr, (uint32_t)e.value, 0); });
+    case SHARP:     return doRepeats([&]{ IrSender.sendSharp((uint16_t)e.addr, (uint16_t)(e.value&0xFFFF), 0); });
+    default: break;
+  }
+
+  // 2) RAW fallback – když je uložený
+  if (rawOpt && !rawOpt->empty()) {
+    IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz);
+    for (uint8_t r=0; r<repeats; r++){ delay(60); IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz); }
+    return true;
+  }
+
+  // 3) HEURISTICKÝ FALLBACK pro UNKNOWN bez RAW
+switch (e.bits) {
+  case 32:
+    // 32 b je nejčastěji NEC – zkus jen NEC (ať se přijímač zbytečně nechytačí na ONKYO/Kaseikyo)
+    if (doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, 32); })) return true;
+
+    // volitelně Samsung jen pokud máme aspoň něco v addr/cmd (jinak to často „přepřekládá“ na ONKYO)
+    if (e.addr || (e.value & 0xFFFF)) {
+      uint16_t a = e.addr ? (uint16_t)e.addr : (uint16_t)(e.value >> 16);
+      uint16_t c = (uint16_t)(e.value & 0xFFFF);
+      if (doRepeats([&]{ IrSender.sendSamsung(a, c, 0); })) return true;
+    }
+    break;
+
+  case 12: case 15:
+    if (doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); })) return true;
+    break;
+
+  case 16:
+    if (doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, 16, false); })) return true;
+    break;
+
+  case 20:
+    if (doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, 20); })) return true;
+    break;
+}
+return false;
+}
+
+// === Odeslání „podle indexu“ – načte případný RAW a zavolá Core ===
+static bool irSendLearnedByIndex(int index, uint8_t repeats) {
+  const LearnedCode* e = getLearnedByIndex(index);
+  if (!e) return false;
+
+  std::vector<uint16_t> raw;
+  uint8_t khz = 38;
+  if (fsLoadRawForIndex(index, raw, khz)) {
+    return irSendLearnedCore(*e, repeats, &raw, khz);
+  } else {
+    // Bez RAW, zkus aspoň nativní dle labelu
+    return irSendLearnedCore(*e, repeats, nullptr, 38);
+  }
 }
 
 static bool findProtoInHistory(uint32_t value, uint8_t bits, uint32_t addr, decode_type_t &outProto) {
@@ -310,20 +498,39 @@ static bool jsonExtractString(const String &line, const char *key, String &out) 
 String fsReadLearnedAsArrayJSON() {
   File f = LittleFS.open(LEARN_FILE, FILE_READ);
   if (!f) return "[]";
+
+  // Načti celý soubor a oprav nalepené objekty
+  String content = f.readString();  // může obsahovat \r\n, \n, nebo žádný newline
+  f.close();
+
+  // 1) Vlož čárku mezi '}{' (dva JSON objekty slepené bez oddělovače)
+  //    Ošetříme i varianty s bílými znaky: '}\n{' apod. necháváme být – ty jsou OK.
+  for (;;) {
+    int pos = content.indexOf(F("}{"));
+    if (pos < 0) break;
+    content = content.substring(0, pos + 1) + F(",") + content.substring(pos + 1);
+  }
+
+  // 2) Rozsekej na řádky a poskládej jako správné pole
   String out = "[";
   bool first = true;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
+  int start = 0;
+  while (start < (int)content.length()) {
+    int end = content.indexOf('\n', start);
+    if (end < 0) end = content.length();
+    String line = content.substring(start, end);
     line.trim();
-    if (!line.length()) continue;
-    if (!first) out += ',';
-    first = false;
-    out += line;
+    if (line.length()) {
+      if (!first) out += ',';
+      first = false;
+      out += line;
+    }
+    start = end + 1;
   }
-  f.close();
   out += "]";
   return out;
 }
+
 
 // Pozn.: Pokud pošleš sem položku, jejíž value/bits/addr odpovídají poslednímu zachycenému kódu,
 // můžeš teoreticky doplnit RAW i bez přímého přístupu do interního bufferu knihovny.
@@ -347,25 +554,37 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
   line += F(",\"function\":\"");line += jsonEscape(functionName);   line += '\"';
   line += F(",\"remote_label\":\""); line += jsonEscape(remoteLabel); line += '\"';
 
-  // Pokud bys měl čerstvě připravené RAW (externě), můžeš jej tady připojit
-  // (g_lastRawValid zatím nevyužíváme – není spolehlivě naplněno na tvé verzi knihovny)
+    // Pokud máme právě „čerstvý“ RAW (v této verzi typicky nemáme), přibalíme ho
   if (g_lastRawValid && lastUnknown.value == value && lastUnknown.bits == bits && lastUnknown.address == addr) {
     line += F(",\"raw\":[");
-    for (size_t i = 0; i < g_lastRawMicros.size(); i++) {
+    for (size_t i = 0; i < g_lastRaw.size(); i++) {
       if (i) line += ',';
-      line += (uint32_t)g_lastRawMicros[i];
+      line += (uint32_t)g_lastRaw[i];
     }
     line += ']';
-    line += F(",\"freq\":"); line += (uint32_t)g_lastFreqKHz;
+    line += F(",\"freq\":"); line += (uint32_t)g_lastRawKhz;
   }
+
 
   line += F("}\n");
 
   size_t w = f.print(line);
   f.close();
   bool ok = (w == line.length());
-  if (ok) { invalidateLearnedCache(); refreshLearnedAssociations(); }
-  return ok;
+f.close();
+
+if (ok) {
+  invalidateLearnedCache();
+  refreshLearnedAssociations();
+
+  // Připoj RAW soubor k právě přidané položce (pokud je k dispozici)
+  if (g_lastRawValid && !g_lastRaw.empty()) {
+    size_t idx = getLearnedCount() ? (getLearnedCount() - 1) : 0;
+    fsSaveRawForIndex(idx, g_lastRaw.data(), (uint16_t)g_lastRaw.size(), g_lastRawKhz);
+  }
+}
+return ok;
+
 }
 
 bool fsUpdateLearned(size_t index, const String &protoStr,
@@ -643,12 +862,24 @@ static void initIrSender(int8_t pin) {
 }
 
 // ======================== Sběr RAW – STUB (bezpečný) ========================
-// Tady nic neděláme, protože tvá verze IRremote neposkytuje rawDataPtr.
-// RAW se očekává v /learned.jsonl u položky (klíče "raw" a "freq").
+// Bezpečný STUB – tvoje verze IRremote neumí přímo surový buffer.
+// Tímto jen resetneme případný předchozí RAW.
 static void captureLastRawFromReceiver() {
   g_lastRawValid = false;
-  g_lastRawMicros.clear();
-  g_lastFreqKHz = 38;
+  g_lastRaw.clear();
+  g_lastRawKhz = 38;
+}
+
+// Jednotné mapování labelu na IRremote enum.
+// Použijeme už tvou "relaxed" verzi pro tolerantní match.
+static decode_type_t parseProtoLabel(const String &s) {
+  return parseProtoLabelRelaxed(s);
+}
+
+// Počet naučených položek pro WebUI (/learn_save připojuje RAW k poslední).
+size_t getLearnedCount() {
+  ensureLearnedCacheLoaded();
+  return g_learnedCache.size();
 }
 
 // ======================== WebUI.h bude používat tyto symboly ========================
@@ -702,6 +933,10 @@ void setup() {
 
   // IR přijímač
   IrReceiver.begin(IR_RX_PIN, DISABLE_LED_FEEDBACK);
+  pinMode(IR_RX_PIN, INPUT_PULLUP);              // demodulátor většinou tahá do HIGH
+  attachInterrupt(digitalPinToInterrupt(IR_RX_PIN), irEdgeISR, CHANGE);
+  Serial.println(F("[RAW] Sniffer aktivní (GPIO CHANGE ISR)."));
+
   Serial.print(F("Protokoly povoleny: "));
   IrReceiver.printActiveIRProtocols(&Serial);
   Serial.println();
@@ -709,6 +944,7 @@ void setup() {
 
 void loop() {
   serviceClient();
+  rawSnifferService();
 
   if (!IrReceiver.decode()) {
     delay(1);
