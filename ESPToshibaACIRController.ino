@@ -5,6 +5,13 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <FS.h>
+
+// ==== IRremote nastavení MUSÍ být před #include <IRremote.hpp> ====
+// větší buffer pro dlouhé AC rámce (Toshiba ~150–250 přechodů)
+#define RAW_BUFFER_LENGTH 400
+// tolerance měření (±25 % je pro AC rozumné)
+#define SUPPORT_TIMING_TEST_FUNCTIONS false
+
 #define IR_GLOBAL
 #include <IRremote.hpp>
 #include <vector>
@@ -80,6 +87,8 @@ static size_t histWrite = 0;
 static size_t histCount = 0;
 static const uint32_t RAW_EVENT_MATCH_WINDOW_MS = 250;
 static std::vector<uint16_t> g_lastRaw;
+static uint16_t g_lastRawBuffer[RAW_BUFFER_LENGTH];
+static uint16_t g_lastRawLength = 0;
 static uint8_t  g_lastRawKhz = 38;   // default
 static bool     g_lastRawValid = false;
 static uint32_t g_lastRawCaptureMs = 0;
@@ -195,11 +204,14 @@ static inline uint32_t micros_safe() { return micros(); }
 
 static void finalizeRawCapture(const uint16_t *src, uint16_t count,
                                const __FlashStringHelper *label,
-                               uint32_t trailingGapUs = 0) {
+                               uint32_t trailingGapUs = 0,
+                               bool applyHeuristics = true,
+                               uint8_t freqKhz = 38) {
   g_lastRaw.clear();
   if (!src || count == 0) {
     g_lastRawValid = false;
     g_lastRawKhz = 38;
+    g_lastRawLength = 0;
     g_lastRawSource = F("(missing)");
     g_lastRawCaptureMs = millis();
     return;
@@ -210,40 +222,56 @@ static void finalizeRawCapture(const uint16_t *src, uint16_t count,
     g_lastRaw.push_back(src[i]);
   }
 
-  if (g_lastRaw.size() > 2 && g_lastRaw[0] < 150) {
-    g_lastRaw[1] = (uint16_t)std::min<uint32_t>(0xFFFF, (uint32_t)g_lastRaw[0] + g_lastRaw[1]);
-    g_lastRaw.erase(g_lastRaw.begin());
-  }
+  if (applyHeuristics) {
+    if (g_lastRaw.size() > 2 && g_lastRaw[0] < 150) {
+      g_lastRaw[1] = (uint16_t)std::min<uint32_t>(0xFFFF, (uint32_t)g_lastRaw[0] + g_lastRaw[1]);
+      g_lastRaw.erase(g_lastRaw.begin());
+    }
 
-  if (g_lastRaw.size() > 3) {
-    const uint32_t first = g_lastRaw[0];
-    const uint32_t second = g_lastRaw[1];
-    const uint32_t third = g_lastRaw[2];
-    if (first > 2000 && second > 2000 && third < 1200) {
-      uint32_t merged = first + second;
-      if (merged > 0xFFFF) merged = 0xFFFF;
-      g_lastRaw[0] = static_cast<uint16_t>(merged);
-      g_lastRaw.erase(g_lastRaw.begin() + 1);
+    if (g_lastRaw.size() > 3) {
+      const uint32_t first = g_lastRaw[0];
+      const uint32_t second = g_lastRaw[1];
+      const uint32_t third = g_lastRaw[2];
+      if (first > 2000 && second > 2000 && third < 1200) {
+        uint32_t merged = first + second;
+        if (merged > 0xFFFF) merged = 0xFFFF;
+        g_lastRaw[0] = static_cast<uint16_t>(merged);
+        g_lastRaw.erase(g_lastRaw.begin() + 1);
+      }
+    }
+
+    if ((g_lastRaw.size() & 1) == 1) {
+      uint32_t gap = trailingGapUs;
+      if (gap == 0) {
+        gap = RAW_FRAME_GAP_US;
+      }
+      if (gap > 0xFFFF) {
+        gap = 0xFFFF;
+      }
+      g_lastRaw.push_back(static_cast<uint16_t>(gap));
     }
   }
 
-  g_lastRawKhz = 38;
+  g_lastRawKhz = freqKhz;
   g_lastRawValid = !g_lastRaw.empty();
   g_lastRawCaptureMs = millis();
-  if ((g_lastRaw.size() & 1) == 1) {
-    uint32_t gap = trailingGapUs;
-    if (gap == 0) {
-      gap = RAW_FRAME_GAP_US;
-    }
-    if (gap > 0xFFFF) {
-      gap = 0xFFFF;
-    }
-    g_lastRaw.push_back(static_cast<uint16_t>(gap));
-  }
   if (label) {
     g_lastRawSource = String(label);
   } else {
     g_lastRawSource = F("sniffer");
+  }
+
+  if (g_lastRawValid) {
+    const uint16_t toCopy = std::min<uint16_t>(g_lastRaw.size(), RAW_BUFFER_LENGTH);
+    for (uint16_t i = 0; i < toCopy; ++i) {
+      g_lastRawBuffer[i] = g_lastRaw[i];
+    }
+    g_lastRawLength = toCopy;
+    if (g_lastRaw.size() > RAW_BUFFER_LENGTH) {
+      Serial.println(F("[RAW] Varování: zachycený rámec byl zkrácen kvůli RAW_BUFFER_LENGTH."));
+    }
+  } else {
+    g_lastRawLength = 0;
   }
 }
 
@@ -981,23 +1009,23 @@ static bool irSendLearned(const LearnedCode &e, uint8_t repeats) {
 }
 
 static bool irSendLastRaw(uint8_t repeats) {
-  if (!g_lastRawValid || g_lastRaw.empty()) {
+  if (!g_lastRawValid || g_lastRawLength < 2) {
     recordSendDiagnostics(false, F("raw-capture-missing"), UNKNOWN, 0, g_lastRawKhz);
     return false;
   }
 
   Serial.print(F("[IR-TX] Posílám poslední zachycený RAW ("));
-  Serial.print(g_lastRaw.size());
+  Serial.print(g_lastRawLength);
   Serial.print(F(" pulsů, "));
   Serial.print(g_lastRawKhz);
   Serial.println(F("kHz)"));
 
   for (uint8_t r = 0; r <= repeats; ++r) {
-    IrSender.sendRaw(g_lastRaw.data(), static_cast<uint16_t>(g_lastRaw.size()), g_lastRawKhz);
+    IrSender.sendRaw(g_lastRawBuffer, g_lastRawLength, g_lastRawKhz);
     if (r < repeats) delay(60);
   }
 
-  recordSendDiagnostics(true, F("raw-capture"), UNKNOWN, g_lastRaw.size(), g_lastRawKhz);
+  recordSendDiagnostics(true, F("raw-capture"), UNKNOWN, g_lastRawLength, g_lastRawKhz);
   return true;
 }
 
@@ -1111,7 +1139,7 @@ static void initIrSender(int8_t pin) {
 #endif
   // Inicializuj i globální instanci IrSender používanou pro přehrávání naučených kódů.
   // Bez explicitního begin() zůstane neaktivní a sendRaw()/sendNEC atd. nebudou nic vysílat.
-  IrSender.begin(g_irTxPin);
+  IrSender.begin(g_irTxPin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN, true);
   toshiba.begin();
   Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(g_irTxPin);
 }
@@ -1132,45 +1160,21 @@ static void configureAuxPowerPins() {
   Serial.println(F(" inicializovány."));
 }
 
-// ======================== Sběr RAW – STUB (bezpečný) ========================
-// Bezpečný STUB – tvoje verze IRremote neumí přímo surový buffer.
-// Tímto jen resetneme případný předchozí RAW.
+// ======================== Sběr RAW (IRremote) ========================
 static void captureLastRawFromReceiver() {
-  if (g_lastRawValid) {
-    g_lastRawCaptureMs = millis();
-    g_isrFrameReady = false;
-    return;
-  }
+  uint16_t compensated[RAW_BUFFER_LENGTH];
+  uint16_t len = IrReceiver.compensateAndStoreIRResultInArray(compensated, RAW_BUFFER_LENGTH);
 
-  noInterrupts();
-  uint16_t count = g_isrCount;
-  bool truncated = (count >= RAW_MAX_PULSES);
-  if (count > RAW_MAX_PULSES) {
-    count = RAW_MAX_PULSES;
-  }
-  uint32_t trailingGap = 0;
-  if (count > 0) {
-    trailingGap = micros_safe() - g_isrLastEdgeUs;
-  }
-  for (uint16_t i = 0; i < count; ++i) {
-    g_rawScratch[i] = g_isrPulses[i];
-  }
-  g_isrCount = 0;
-  g_isrLastLevel = -1;
-  interrupts();
-
-  if (count > 0) {
-    finalizeRawCapture(g_rawScratch, count, F("decoder"), trailingGap);
-    if (truncated) {
-      Serial.println(F("[RAW] Varování: zachycený rámec byl zkrácen na 512 pulsů."));
-    }
-  } else {
+  if (len == 0) {
     g_lastRawValid = false;
     g_lastRaw.clear();
+    g_lastRawLength = 0;
     g_lastRawKhz = 38;
     g_lastRawCaptureMs = millis();
     g_lastRawSource = F("(missing)");
     Serial.println(F("[RAW] Upozornění: pro poslední rámec není dostupný RAW záznam."));
+  } else {
+    finalizeRawCapture(compensated, len, F("decoder"), 0, false, 38);
   }
 
   g_isrFrameReady = false;
@@ -1350,7 +1354,9 @@ void setup() {
   startWebServer();
 
   // IR přijímač
-  IrReceiver.begin(IR_RX_PIN, DISABLE_LED_FEEDBACK);
+  IrReceiver.begin(IR_RX_PIN, ENABLE_LED_FEEDBACK);
+  IrReceiver.setReceiveTolerance(25);
+  IrReceiver.setUnknownThreshold(12);
   pinMode(IR_RX_PIN, INPUT_PULLUP);              // demodulátor většinou tahá do HIGH
   attachInterrupt(digitalPinToInterrupt(IR_RX_PIN), irEdgeISR, CHANGE);
   Serial.println(F("[RAW] Sniffer aktivní (GPIO CHANGE ISR)."));
