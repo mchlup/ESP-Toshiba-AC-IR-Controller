@@ -191,9 +191,41 @@ volatile uint16_t g_isrCount = 0;
 volatile uint32_t g_isrLastEdgeUs = 0;
 volatile int      g_isrLastLevel = -1;  // -1 = neumíme
 volatile bool     g_isrFrameReady = false;
+static uint16_t   g_rawScratch[RAW_MAX_PULSES];
 
 // Pomocné: bezpečné čtení micros v ISR/loop
 static inline uint32_t micros_safe() { return micros(); }
+
+static void finalizeRawCapture(const uint16_t *src, uint16_t count,
+                               const __FlashStringHelper *label) {
+  g_lastRaw.clear();
+  if (!src || count == 0) {
+    g_lastRawValid = false;
+    g_lastRawKhz = 38;
+    g_lastRawSource = F("(missing)");
+    g_lastRawCaptureMs = millis();
+    return;
+  }
+
+  g_lastRaw.reserve(count);
+  for (uint16_t i = 0; i < count; ++i) {
+    g_lastRaw.push_back(src[i]);
+  }
+
+  if (g_lastRaw.size() > 2 && g_lastRaw[0] < 150) {
+    g_lastRaw[1] = (uint16_t)std::min<uint32_t>(0xFFFF, (uint32_t)g_lastRaw[0] + g_lastRaw[1]);
+    g_lastRaw.erase(g_lastRaw.begin());
+  }
+
+  g_lastRawKhz = 38;
+  g_lastRawValid = !g_lastRaw.empty();
+  g_lastRawCaptureMs = millis();
+  if (label) {
+    g_lastRawSource = String(label);
+  } else {
+    g_lastRawSource = F("sniffer");
+  }
+}
 
 // ISR: ukládá délky pulsů v µs mezi hranami
 void IRAM_ATTR irEdgeISR() {
@@ -228,33 +260,14 @@ static void rawSnifferService() {
   if (g_isrCount > 0 && !g_isrFrameReady) {
     uint32_t gap = micros_safe() - g_isrLastEdgeUs;
     if (gap > RAW_FRAME_GAP_US) {
-      // zkopíruj a připrav g_lastRaw jako střídající se MARK/SPACE (začneme MARK)
       noInterrupts();
       uint16_t n = g_isrCount;
-      static uint16_t tmp[RAW_MAX_PULSES];
-      for (uint16_t i = 0; i < n; i++) tmp[i] = g_isrPulses[i];
+      for (uint16_t i = 0; i < n; i++) g_rawScratch[i] = g_isrPulses[i];
       g_isrCount = 0;
       g_isrLastLevel = -1;
       interrupts();
 
-      // demodulátor: typicky první úsek je SPACE (idle HIGH → první hrana do LOW = začátek MARK)
-      // Chceme začít MARKem. Pokud by to nevycházelo, jen posuneme o 1.
-      // (Je to „best effort“ – demodulátor dělá thresholding. Pro sendRaw je to OK.)
-      g_lastRaw.clear();
-      g_lastRaw.reserve(n);
-      for (uint16_t i = 0; i < n; i++) g_lastRaw.push_back(tmp[i]);
-
-      // Heuristika: pokud je prvních pár µs podezřele krátkých (< 150 µs), sloučíme je
-      if (g_lastRaw.size() > 2 && g_lastRaw[0] < 150) {
-        g_lastRaw[1] = (uint16_t)std::min<uint32_t>(0xFFFF, (uint32_t)g_lastRaw[0] + g_lastRaw[1]);
-        g_lastRaw.erase(g_lastRaw.begin()); // zahodíme první
-      }
-
-      // Bez měření nosné – zůstaneme u 38 kHz (většina spotřební elektroniky)
-      g_lastRawKhz = 38;
-      g_lastRawValid = !g_lastRaw.empty();
-      g_lastRawCaptureMs = millis();
-      g_lastRawSource = F("sniffer");
+      finalizeRawCapture(g_rawScratch, n, F("sniffer"));
       g_isrFrameReady = true;  // jen pro debug; další hrana to zruší
     }
   }
@@ -1082,10 +1095,28 @@ static void configureAuxPowerPins() {
 static void captureLastRawFromReceiver() {
   if (g_lastRawValid) {
     g_lastRawCaptureMs = millis();
+    g_isrFrameReady = false;
+    return;
+  }
+
+  noInterrupts();
+  uint16_t count = g_isrCount;
+  for (uint16_t i = 0; i < count; ++i) g_rawScratch[i] = g_isrPulses[i];
+  g_isrCount = 0;
+  g_isrLastLevel = -1;
+  interrupts();
+
+  if (count > 0) {
+    finalizeRawCapture(g_rawScratch, count, F("decoder"));
   } else {
+    g_lastRawValid = false;
+    g_lastRaw.clear();
+    g_lastRawKhz = 38;
+    g_lastRawCaptureMs = millis();
     g_lastRawSource = F("(missing)");
     Serial.println(F("[RAW] Upozornění: pro poslední rámec není dostupný RAW záznam."));
   }
+
   g_isrFrameReady = false;
 }
 
