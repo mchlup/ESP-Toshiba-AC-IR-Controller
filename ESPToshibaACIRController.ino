@@ -151,12 +151,8 @@ static bool fsHasRaw(size_t index) {
 // Pokud tvá API vrstva nevrací index nově vložené položky, použij getLearnedCount()
 extern size_t getLearnedCount(); // doplň, nebo přepiš dle tvé implementace
 
-// Zavolej hned po IrReceiver.decode() úspěchu (tj. když máš vyplněné decodedIRData)
-static void snapshotLastRawFromReceiver() {
-  g_lastRawValid = false;
-  g_lastRaw.clear();
-  g_lastRawKhz = 38;
-}
+// Zavolej hned po IrReceiver.decode() úspěchu (tj. když máš vyplněné decodedIRData).
+// captureLastRawFromReceiver() se postará o bezpečné převzetí posledních pulsů.
 
 static void addToHistory(const IRData &d, int16_t learnedIndex) {
   IREvent e;
@@ -1120,13 +1116,22 @@ static void captureLastRawFromReceiver() {
 
   noInterrupts();
   uint16_t count = g_isrCount;
-  for (uint16_t i = 0; i < count; ++i) g_rawScratch[i] = g_isrPulses[i];
+  bool truncated = (count >= RAW_MAX_PULSES);
+  if (count > RAW_MAX_PULSES) {
+    count = RAW_MAX_PULSES;
+  }
+  for (uint16_t i = 0; i < count; ++i) {
+    g_rawScratch[i] = g_isrPulses[i];
+  }
   g_isrCount = 0;
   g_isrLastLevel = -1;
   interrupts();
 
   if (count > 0) {
     finalizeRawCapture(g_rawScratch, count, F("decoder"));
+    if (truncated) {
+      Serial.println(F("[RAW] Varování: zachycený rámec byl zkrácen na 512 pulsů."));
+    }
   } else {
     g_lastRawValid = false;
     g_lastRaw.clear();
