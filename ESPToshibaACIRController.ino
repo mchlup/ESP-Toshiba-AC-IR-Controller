@@ -67,7 +67,9 @@ static const int8_t IR_TX_PIN_DEFAULT = 0;   // ESP32-C3: např. 0 (přizpůsob 
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_TX_PIN = 4;   // uprav dle zapojení
 ToshibaACIR toshiba(IR_TX_PIN);
-static const uint8_t IR_RX_PIN = 10;         // ESP32-C3: ověřené 4/5/10
+static const uint8_t POWER_GND_PIN = 9;
+static const uint8_t POWER_VCC_PIN = 10;
+static const uint8_t IR_RX_PIN = 5;         // ESP32-C3: ověřené 4/5/10
 static const uint32_t DUP_FILTER_MS = 120;
 Preferences prefs;                 // NVS namespace: "irrecv"
 static const char* LEARN_FILE = "/learned.jsonl";
@@ -1037,6 +1039,22 @@ static void initIrSender(int8_t pin) {
   Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(pin);
 }
 
+static void configureAuxPowerPins() {
+  // Nejprve přepneme piny do známých stavů, abychom neovlivnili boot strapping.
+  pinMode(POWER_GND_PIN, INPUT);
+  pinMode(POWER_VCC_PIN, INPUT);
+
+  digitalWrite(POWER_GND_PIN, LOW);
+  pinMode(POWER_GND_PIN, OUTPUT);
+
+  digitalWrite(POWER_VCC_PIN, HIGH);
+  pinMode(POWER_VCC_PIN, OUTPUT);
+
+  Serial.print(F("[POWER] GND pin ")); Serial.print(POWER_GND_PIN);
+  Serial.print(F(", VCC pin ")); Serial.print(POWER_VCC_PIN);
+  Serial.println(F(" inicializovány."));
+}
+
 // ======================== Sběr RAW – STUB (bezpečný) ========================
 // Bezpečný STUB – tvoje verze IRremote neumí přímo surový buffer.
 // Tímto jen resetneme případný předchozí RAW.
@@ -1176,6 +1194,7 @@ void setup() {
 
   Serial.println();
   Serial.println(F("=== IR Receiver (IRremote) – ESP32-C3 ==="));
+  configureAuxPowerPins();
   Serial.print(F("IR RX pin: ")); Serial.println(IR_RX_PIN);
 
   if (!LittleFS.begin(true)) {
