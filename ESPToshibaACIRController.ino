@@ -215,6 +215,18 @@ static void finalizeRawCapture(const uint16_t *src, uint16_t count,
     g_lastRaw.erase(g_lastRaw.begin());
   }
 
+  if (g_lastRaw.size() > 3) {
+    const uint32_t first = g_lastRaw[0];
+    const uint32_t second = g_lastRaw[1];
+    const uint32_t third = g_lastRaw[2];
+    if (first > 2000 && second > 2000 && third < 1200) {
+      uint32_t merged = first + second;
+      if (merged > 0xFFFF) merged = 0xFFFF;
+      g_lastRaw[0] = static_cast<uint16_t>(merged);
+      g_lastRaw.erase(g_lastRaw.begin() + 1);
+    }
+  }
+
   g_lastRawKhz = 38;
   g_lastRawValid = !g_lastRaw.empty();
   g_lastRawCaptureMs = millis();
