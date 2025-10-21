@@ -194,7 +194,8 @@ static uint16_t   g_rawScratch[RAW_MAX_PULSES];
 static inline uint32_t micros_safe() { return micros(); }
 
 static void finalizeRawCapture(const uint16_t *src, uint16_t count,
-                               const __FlashStringHelper *label) {
+                               const __FlashStringHelper *label,
+                               uint32_t trailingGapUs = 0) {
   g_lastRaw.clear();
   if (!src || count == 0) {
     g_lastRawValid = false;
@@ -217,6 +218,16 @@ static void finalizeRawCapture(const uint16_t *src, uint16_t count,
   g_lastRawKhz = 38;
   g_lastRawValid = !g_lastRaw.empty();
   g_lastRawCaptureMs = millis();
+  if ((g_lastRaw.size() & 1) == 1) {
+    uint32_t gap = trailingGapUs;
+    if (gap == 0) {
+      gap = RAW_FRAME_GAP_US;
+    }
+    if (gap > 0xFFFF) {
+      gap = 0xFFFF;
+    }
+    g_lastRaw.push_back(static_cast<uint16_t>(gap));
+  }
   if (label) {
     g_lastRawSource = String(label);
   } else {
@@ -259,12 +270,14 @@ static void rawSnifferService() {
     if (gap > RAW_FRAME_GAP_US) {
       noInterrupts();
       uint16_t n = g_isrCount;
+      uint32_t lastEdge = g_isrLastEdgeUs;
+      uint32_t trailingGap = micros_safe() - lastEdge;
       for (uint16_t i = 0; i < n; i++) g_rawScratch[i] = g_isrPulses[i];
       g_isrCount = 0;
       g_isrLastLevel = -1;
       interrupts();
 
-      finalizeRawCapture(g_rawScratch, n, F("sniffer"));
+      finalizeRawCapture(g_rawScratch, n, F("sniffer"), trailingGap);
       g_isrFrameReady = true;  // jen pro debug; další hrana to zruší
     }
   }
@@ -1123,6 +1136,10 @@ static void captureLastRawFromReceiver() {
   if (count > RAW_MAX_PULSES) {
     count = RAW_MAX_PULSES;
   }
+  uint32_t trailingGap = 0;
+  if (count > 0) {
+    trailingGap = micros_safe() - g_isrLastEdgeUs;
+  }
   for (uint16_t i = 0; i < count; ++i) {
     g_rawScratch[i] = g_isrPulses[i];
   }
@@ -1131,7 +1148,7 @@ static void captureLastRawFromReceiver() {
   interrupts();
 
   if (count > 0) {
-    finalizeRawCapture(g_rawScratch, count, F("decoder"));
+    finalizeRawCapture(g_rawScratch, count, F("decoder"), trailingGap);
     if (truncated) {
       Serial.println(F("[RAW] Varování: zachycený rámec byl zkrácen na 512 pulsů."));
     }
