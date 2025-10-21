@@ -62,7 +62,7 @@ struct LearnedLineDetails {
 
 // ======================== Globální proměnné ========================
 WebServer server(80);
-static const int8_t IR_TX_PIN_DEFAULT = 4;   // ESP32-C3: např. 4 (přizpůsob dle zapojení)
+static const int8_t IR_TX_PIN_DEFAULT = 3;   // ESP32-C3: např. 4 (přizpůsob dle zapojení)
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_RX_PIN = 4;         // ESP32-C3: ověřené 4/5/10
 ToshibaACIR toshiba;
