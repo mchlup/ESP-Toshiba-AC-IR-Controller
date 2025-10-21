@@ -2,6 +2,10 @@
 #include <Arduino.h>
 #include <IRremote.hpp>
 
+extern void recordIrTxDiagnostics(bool ok, decode_type_t proto, size_t pulses,
+                                  uint8_t freqKhz,
+                                  const __FlashStringHelper* methodLabel);
+
 // ====== Přehled ======
 // Odesílá IR kódy pro Toshiba AC ve formátu 9 bajtů (72 bitů), odeslané 2×.
 // Rámec: F2 0D 03 FC 01 [TEMP+PWR] [FAN+MODE] 00 [CHK]
@@ -115,14 +119,14 @@ private:
     // 1. průchod
     encode72(frame);
     // vlož „ticho“ (mezera) mezi duplikovanými rámci
-    raw[n++] = 0;               // IRremote očekává páry (MARK, SPACE).
-    raw[n++] = FRAME_GAP_US;    // mezera bez nosné
+    raw[n++] = FRAME_GAP_US;    // mezera bez nosné (SPACE)
 
     // 2. průchod
     encode72(frame);
 
     // Odeslat RAW (páry: MARK/SPACE; 38 kHz)
     IrSender.sendRaw(raw, (uint_fast8_t)n, kCarrierKhz);
+    recordIrTxDiagnostics(true, UNKNOWN, n, kCarrierKhz, F("toshiba-ac"));
     return true;
   }
 };
