@@ -9,7 +9,6 @@
 // Teplota 17–30 °C => vyšší nibble v byte[5] (0..13) + 0x00/0x20 pro ON/OFF.
 // Režimy (MODE nibble): AUTO=0x0, COOL=0x1, DRY=0x2, HEAT=0x3.
 // Ventilátor (FAN nibble): AUTO=0x0, 1=0x4, 2=0x6, 3=0x8, 4=0xA, 5=0xC.
-// (viz původní poznámky v projektu) 
 
 class ToshibaACIR {
 public:
@@ -28,14 +27,14 @@ public:
   static constexpr uint16_t kBitsPerFrame     = 72;
   static_assert(kBitsPerFrame == kFrameBytes * 8, "Toshiba AC rámec musí mít 72 bitů");
 
-  // Timings (NEC/Samsung-like; vyhovují stávající implementaci)
+  // Timings
   static constexpr uint8_t  kCarrierKhz      = 38;
   static constexpr uint16_t HDR_MARK_US      = 4500;
   static constexpr uint16_t HDR_SPACE_US     = 4500;
   static constexpr uint16_t BIT_MARK_US      = 560;
   static constexpr uint16_t ONE_SPACE_US     = 1600;
   static constexpr uint16_t ZERO_SPACE_US    = 560;
-  static constexpr uint16_t FRAME_GAP_US     = 5000; // mezera mezi 2×72b (bez nosné)
+  static constexpr uint16_t FRAME_GAP_US     = 5000; // mezera mezi 2×72b (SPACE bez nosné)
 
   // Odvozené počty pulsů pro sendRaw()
   static constexpr size_t   kFramePulseCount = 2 + (kBitsPerFrame * 2) + 1; // header + bity + trailing mark
@@ -72,7 +71,7 @@ public:
     uint8_t modeNib = static_cast<uint8_t>(s.mode) & 0x0F;
     out[6] = (uint8_t)((fanNib << 4) | modeNib);
 
-    // Byte 7: 0x00 (nepoužito v této krátké variantě rámce)
+    // Byte 7: 0x00
     out[7] = 0x00;
 
     // Byte 8: XOR checksum of bytes [0..7]
@@ -90,6 +89,7 @@ private:
 };
 
 // Globální diagnostická hook funkce z hlavního sketche
+//enum decode_type_t : uint16_t;
 void recordIrTxDiagnostics(bool ok, decode_type_t proto, size_t pulses,
                            uint8_t freqKhz,
                            const __FlashStringHelper* methodLabel);
@@ -103,9 +103,10 @@ inline void ToshibaACIR::begin() {
     return;
   }
   if (_ir == nullptr) {
-    _ir = new ::IRsend(); // alokujeme jednou na celý běh
+    _ir = new ::IRsend(_pin);     // přiřadíme pin už v konstruktoru
   }
-  _ir->begin(_pin, ENABLE_LED_FEEDBACK);
+  _ir->begin(_pin);               // IRremote 3.3.2: begin(pin[, ledPin])
+  // _ir->begin(_pin, ENABLE_LED_FEEDBACK); // volitelné
 }
 
 inline bool ToshibaACIR::send(const State &s) {
@@ -133,7 +134,7 @@ inline bool ToshibaACIR::sendFrameTwice(const uint8_t frame[kFrameBytes]) {
     raw[n++] = one ? ONE_SPACE_US : ZERO_SPACE_US;
   };
   auto emitTrailMark = [&](void) {
-    raw[n++] = BIT_MARK_US; // závěrečný mark (běžné u NEC/Samsung stylu)
+    raw[n++] = BIT_MARK_US; // trailing mark
   };
 
   auto encode72 = [&](const uint8_t *b) {
