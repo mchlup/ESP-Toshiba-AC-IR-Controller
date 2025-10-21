@@ -1,18 +1,14 @@
 #pragma once
 #include <Arduino.h>
-#include <IRremote.hpp>
-
-extern void recordIrTxDiagnostics(bool ok, decode_type_t proto, size_t pulses,
-                                  uint8_t freqKhz,
-                                  const __FlashStringHelper* methodLabel);
 
 // ====== Přehled ======
 // Odesílá IR kódy pro Toshiba AC ve formátu 9 bajtů (72 bitů), odeslané 2×.
 // Rámec: F2 0D 03 FC 01 [TEMP+PWR] [FAN+MODE] 00 [CHK]
 // CHK = XOR předchozích 8 bajtů.
-// Teplota 17–30 °C => vyšší nibble v bajtu[5] (0..13) + 0x00/0x20 pro ON/OFF.
+// Teplota 17–30 °C => vyšší nibble v byte[5] (0..13) + 0x00/0x20 pro ON/OFF.
 // Režimy (MODE nibble): AUTO=0x0, COOL=0x1, DRY=0x2, HEAT=0x3.
 // Ventilátor (FAN nibble): AUTO=0x0, 1=0x4, 2=0x6, 3=0x8, 4=0xA, 5=0xC.
+// (viz původní poznámky v projektu) 
 
 class ToshibaACIR {
 public:
@@ -31,39 +27,30 @@ public:
   static constexpr uint16_t kBitsPerFrame     = 72;
   static_assert(kBitsPerFrame == kFrameBytes * 8, "Toshiba AC rámec musí mít 72 bitů");
 
-  // Timing (Samsung-like)
-  static constexpr uint16_t kCarrierKhz      = 38;
+  // Timings (NEC/Samsung-like; vyhovují stávající implementaci)
+  static constexpr uint8_t  kCarrierKhz      = 38;
   static constexpr uint16_t HDR_MARK_US      = 4500;
   static constexpr uint16_t HDR_SPACE_US     = 4500;
   static constexpr uint16_t BIT_MARK_US      = 560;
   static constexpr uint16_t ONE_SPACE_US     = 1600;
   static constexpr uint16_t ZERO_SPACE_US    = 560;
   static constexpr uint16_t FRAME_GAP_US     = 5000; // mezera mezi 2×72b (bez nosné)
-  static constexpr size_t   kFramePulseCount = 2 + (kBitsPerFrame * 2) + 1; // hlavička + bity + závěr
-  static constexpr size_t   kTotalPulseCount = (kFramePulseCount * 2) + 1;   // dva rámce + mezera
-  static constexpr size_t   kRawBufferLen    = kTotalPulseCount + 10;        // rezerva
+
+  // Odvozené počty pulsů pro sendRaw()
+  static constexpr size_t   kFramePulseCount = 2 + (kBitsPerFrame * 2) + 1; // header + bity + trailing mark
+  static constexpr size_t   kTotalPulseCount = (kFramePulseCount * 2) + 1;  // 2 rámce + gap
+  static constexpr size_t   kRawBufferLen    = kTotalPulseCount + 10;       // rezerva
 
   explicit ToshibaACIR(int8_t irSendPin = -1) : _pin(irSendPin) {}
 
-  void setSendPin(int8_t irSendPin) { _pin = irSendPin; }
-  int8_t sendPin() const { return _pin; }
+  void    setSendPin(int8_t irSendPin) { _pin = irSendPin; }
+  int8_t  sendPin() const { return _pin; }
 
-  void begin() {
-#if defined(IR_SEND_PIN)
-    // Pokud je IRremote zkonfigurován přes IR_SEND_PIN, nastaví se sám.
-#else
-    if (_pin >= 0) {
-      IrSender.begin(_pin, ENABLE_LED_FEEDBACK);
-    }
-#endif
-  }
+  // Inicializace IR odesílače (volat po nastavení TX pinu)
+  void begin();
 
   // Vytvoří a odešle příkaz podle stavu
-  bool send(const State &s) {
-    uint8_t frame[kFrameBytes];
-    buildFrame(s, frame);
-    return sendFrameTwice(frame);
-  }
+  bool send(const State &s);
 
   // Utilita: sestavení rámce do bufferu (9 bajtů)
   static void buildFrame(const State &s, uint8_t out[kFrameBytes]) {
@@ -84,7 +71,7 @@ public:
     uint8_t modeNib = static_cast<uint8_t>(s.mode) & 0x0F;
     out[6] = (uint8_t)((fanNib << 4) | modeNib);
 
-    // Byte 7: 0x00 (v 144bit rámečku nevyužito)
+    // Byte 7: 0x00 (nepoužito v této krátké variantě rámce)
     out[7] = 0x00;
 
     // Byte 8: XOR checksum of bytes [0..7]
@@ -94,55 +81,10 @@ public:
   }
 
 private:
-  int8_t _pin;
+  int8_t   _pin;
+  struct IRsend;         // forward-declare z IRremote.hpp (nezatahujeme hlavičku do .h)
+  IRsend*  _ir = nullptr;
 
   // Sestaví RAW pulzy pro 72b a pošle je 2×
-  bool sendFrameTwice(const uint8_t frame[kFrameBytes]) {
-#if !defined(IR_SEND_PIN)
-    if (_pin < 0) {
-      recordIrTxDiagnostics(false, UNKNOWN, 0, kCarrierKhz, F("toshiba-ac"));
-      return false;
-    }
-#endif
-
-    static uint16_t raw[kRawBufferLen];
-    size_t n = 0;
-
-    auto emitHeader = [&](void) {
-      raw[n++] = HDR_MARK_US;
-      raw[n++] = HDR_SPACE_US;
-    };
-    auto emitBit = [&](bool one) {
-      raw[n++] = BIT_MARK_US;
-      raw[n++] = one ? ONE_SPACE_US : ZERO_SPACE_US;
-    };
-    auto emitTrailMark = [&](void) {
-      raw[n++] = BIT_MARK_US; // závěrečný mark (běžné u NEC/Samsung stylu)
-    };
-
-    auto encode72 = [&](const uint8_t *b) {
-      emitHeader();
-      for (size_t i = 0; i < kFrameBytes; ++i) {
-        uint8_t val = b[i];
-        // MSB-first (podle publikovaných analyzovaných rámců)
-        for (int bit = 7; bit >= 0; --bit) {
-          emitBit((val >> bit) & 0x01);
-        }
-      }
-      emitTrailMark();
-    };
-
-    encode72(frame);
-    raw[n++] = FRAME_GAP_US;    // mezera bez nosné (SPACE)
-    encode72(frame);
-
-    if (n > kRawBufferLen) {
-      recordIrTxDiagnostics(false, UNKNOWN, n, kCarrierKhz, F("toshiba-ac"));
-      return false;
-    }
-
-    IrSender.sendRaw(raw, static_cast<uint16_t>(n), kCarrierKhz);
-    recordIrTxDiagnostics(true, UNKNOWN, n, kCarrierKhz, F("toshiba-ac"));
-    return true;
-  }
+  bool sendFrameTwice(const uint8_t frame[kFrameBytes]);
 };
