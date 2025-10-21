@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <FS.h>
+#define IR_GLOBAL
 #include <IRremote.hpp>
 #include <vector>
 #include <unordered_map>
