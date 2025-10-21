@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <FS.h>
+#include <IRremote.hpp>
 #include <vector>
 #include <unordered_map>
 #include <ctype.h>
