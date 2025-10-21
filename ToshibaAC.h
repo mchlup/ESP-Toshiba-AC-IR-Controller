@@ -23,7 +23,7 @@ public:
     bool     powerOn   = true;
     Mode     mode      = Mode::AUTO;
     Fan      fan       = Fan::AUTO;
-    uint8_t  tempC     = 23;   // 17..30
+    uint8_t  tempC     = 24;   // 17..30
   };
 
   // Toshiba AC rámec

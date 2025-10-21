@@ -61,3 +61,20 @@ Status sekce průběžně informuje o stavu připojení, posledním naučeném k
 - Pokud potřebujete změnit Wi-Fi síť nebo parametry zařízení, odpojte se od známé Wi-Fi (např. vypnutím routeru). Po několika neúspěšných pokusech o připojení WiFiManager automaticky znovu otevře konfigurační portál.
 - Učení se automaticky ukončí po uplynutí nastaveného limitu (výchozí 60 s), pokud není zachycen žádný kód.
 - Kódy známých protokolů jsou ukládány společně se surovými daty, takže je možné je reprodukovat i pro neznámé protokoly.
+
+
+## Toshiba IR control (ESP32-C3 + IRremote 3.3.2)
+
+Tento firmware obsahuje nativní vysílání IR kódů pro klimatizace Toshiba (kompaktní 72bit rámec). Pro správnou funkci:
+
+1. **Zapojení IR LED** – zvolený GPIO (např. GPIO4) propojte přes rezistor 100–220 Ω na anodu IR LED, katodu veďte na GND.
+2. **Nastavení TX pinu** – v hlavním WebUI na kartě nastavení zadejte číslo pinu a uložte. Změna okamžitě inicializuje jedinou instanci `IrSender`.
+3. **Odeslání příkazu** – buď použijte panel „Toshiba IR“ ve WebUI, nebo REST API:
+
+```
+GET /api/toshiba_send?power=1&mode=heat&temp=23&fan=3
+GET /api/toshiba_send?power=1&mode=cool&temp=25&fan=auto
+GET /api/toshiba_send?power=0
+```
+
+Parametry `power`, `mode`, `temp` (17–30 °C) a `fan` (`auto` nebo 1–5) jsou volitelné; nevyplněné hodnoty doplní výchozí stav (zapnuto, auto, 24 °C, auto ventilátor).
