@@ -226,7 +226,7 @@ static inline void irSenderBeginCompat(uint_fast8_t pin) {
 
 template <typename Receiver>
 auto setReceiveToleranceDispatch(Receiver &receiver, uint8_t tolerance, int)
-    -> decltype(receiver.setReceiveTolerance(tolerance), void()) {
+    -> decltype(std::declval<Receiver &>().setReceiveTolerance(uint8_t{}), void()) {
   receiver.setReceiveTolerance(tolerance);
 }
 
@@ -239,7 +239,7 @@ static inline void setReceiveToleranceCompat(uint8_t tolerance) {
 
 template <typename Receiver>
 auto setUnknownThresholdDispatch(Receiver &receiver, uint8_t threshold, int)
-    -> decltype(receiver.setUnknownThreshold(threshold), void()) {
+    -> decltype(std::declval<Receiver &>().setUnknownThreshold(uint8_t{}), void()) {
   receiver.setUnknownThreshold(threshold);
 }
 
@@ -252,11 +252,24 @@ static inline void setUnknownThresholdCompat(uint8_t threshold) {
 
 template <typename Receiver>
 auto compensateAndStoreDispatch(Receiver &receiver, uint16_t *dest, uint16_t maxLen, int)
-    -> decltype(receiver.compensateAndStoreIRResultInArray(dest, maxLen)) {
+    -> decltype(std::declval<Receiver &>().compensateAndStoreIRResultInArray(static_cast<uint16_t *>(nullptr), uint16_t{})) {
   return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
 }
 
-static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16_t maxLen) {
+namespace detail {
+template <typename T>
+struct has_rawDataPtr {
+ private:
+  template <typename U>
+  static auto test(int) -> decltype(std::declval<U>().rawDataPtr, std::true_type{});
+  template <typename>
+  static auto test(...) -> std::false_type;
+
+ public:
+  static constexpr bool value = decltype(test<T>(0))::value;
+};
+
+static uint16_t compensateAndStoreLegacyImpl(IRData *rawData, uint16_t *dest, uint16_t maxLen, std::true_type) {
   if (!rawData || !rawData->rawDataPtr) {
     return 0;
   }
@@ -306,6 +319,66 @@ static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16
   }
 
   return rawLen;
+}
+
+static uint16_t compensateAndStoreLegacyImpl(IRData *rawData, uint16_t *dest, uint16_t maxLen, std::false_type) {
+  if (!rawData || !rawData->rawbuf) {
+    return 0;
+  }
+
+  const auto *rawBuf = rawData->rawbuf;
+  uint16_t rawLen = rawData->rawlen;
+  if (rawLen > maxLen) {
+    rawLen = maxLen;
+  }
+
+#if defined(MARK_EXCESS_MICROS)
+  const int32_t markExcess = MARK_EXCESS_MICROS;
+#elif defined(MARK_EXCESS)
+  const int32_t markExcess = MARK_EXCESS;
+#else
+  const int32_t markExcess = 0;
+#endif
+
+  for (uint16_t i = 0; i < rawLen; ++i) {
+    uint32_t usec = static_cast<uint32_t>(rawBuf[i]) * MICROS_PER_TICK;
+    if ((i & 1U) == 0U) {
+      // MARK
+      if (markExcess >= 0) {
+        usec += static_cast<uint32_t>(markExcess);
+      } else if (usec > static_cast<uint32_t>(-markExcess)) {
+        usec -= static_cast<uint32_t>(-markExcess);
+      } else {
+        usec = 0;
+      }
+    } else {
+      // SPACE
+      if (markExcess >= 0) {
+        if (usec > static_cast<uint32_t>(markExcess)) {
+          usec -= static_cast<uint32_t>(markExcess);
+        } else {
+          usec = 0;
+        }
+      } else {
+        usec += static_cast<uint32_t>(-markExcess);
+      }
+    }
+
+    if (usec > 0xFFFFU) {
+      usec = 0xFFFFU;
+    }
+    dest[i] = static_cast<uint16_t>(usec);
+  }
+
+  return rawLen;
+}
+
+}  // namespace detail
+
+static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16_t maxLen) {
+  return detail::compensateAndStoreLegacyImpl(
+      rawData, dest, maxLen,
+      std::integral_constant<bool, detail::has_rawDataPtr<IRData>::value>{});
 }
 
 template <typename Receiver>
