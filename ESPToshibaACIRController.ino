@@ -290,13 +290,49 @@ struct has_nested_rawbuf {
 };
 
 template <typename T>
-struct raw_access_mode {
-  static constexpr int value = has_rawDataPtr<T>::value
-                                   ? 0
-                                   : (has_nested_rawbuf<T>::value
-                                          ? 1
-                                          : (has_direct_rawbuf<T>::value ? 2 : -1));
-};
+auto getRawBuffer(T *rawData, uint16_t &rawLen)
+    -> typename std::enable_if<has_rawDataPtr<T>::value, const uint16_t *>::type {
+  if (!rawData || !rawData->rawDataPtr) {
+    rawLen = 0;
+    return nullptr;
+  }
+  rawLen = rawData->rawDataPtr->rawlen;
+  return rawData->rawDataPtr->rawbuf;
+}
+
+template <typename T>
+auto getRawBuffer(T *rawData, uint16_t &rawLen)
+    -> typename std::enable_if<!has_rawDataPtr<T>::value && has_nested_rawbuf<T>::value,
+                               const uint16_t *>::type {
+  if (!rawData) {
+    rawLen = 0;
+    return nullptr;
+  }
+  rawLen = rawData->rawData.rawlen;
+  return rawData->rawData.rawbuf;
+}
+
+template <typename T>
+auto getRawBuffer(T *rawData, uint16_t &rawLen)
+    -> typename std::enable_if<!has_rawDataPtr<T>::value && !has_nested_rawbuf<T>::value &&
+                                   has_direct_rawbuf<T>::value,
+                               const uint16_t *>::type {
+  if (!rawData) {
+    rawLen = 0;
+    return nullptr;
+  }
+  rawLen = rawData->rawlen;
+  return rawData->rawbuf;
+}
+
+template <typename T>
+auto getRawBuffer(T *, uint16_t &rawLen)
+    -> typename std::enable_if<!has_rawDataPtr<T>::value && !has_nested_rawbuf<T>::value &&
+                                   !has_direct_rawbuf<T>::value,
+                               const uint16_t *>::type {
+  rawLen = 0;
+  return nullptr;
+}
 
 static uint16_t copyAndCompensateRawBuffer(const uint16_t *rawBuf, uint16_t rawLen,
                                            uint16_t *dest, uint16_t maxLen) {
@@ -349,36 +385,6 @@ static uint16_t copyAndCompensateRawBuffer(const uint16_t *rawBuf, uint16_t rawL
   return rawLen;
 }
 
-static uint16_t compensateAndStoreLegacyImpl(IRData *rawData, uint16_t *dest, uint16_t maxLen,
-                                             std::integral_constant<int, 0>) {
-  if (!rawData || !rawData->rawDataPtr) {
-    return 0;
-  }
-  return copyAndCompensateRawBuffer(rawData->rawDataPtr->rawbuf, rawData->rawDataPtr->rawlen, dest,
-                                    maxLen);
-}
-
-static uint16_t compensateAndStoreLegacyImpl(IRData *rawData, uint16_t *dest, uint16_t maxLen,
-                                             std::integral_constant<int, 1>) {
-  if (!rawData) {
-    return 0;
-  }
-  return copyAndCompensateRawBuffer(rawData->rawData.rawbuf, rawData->rawData.rawlen, dest, maxLen);
-}
-
-static uint16_t compensateAndStoreLegacyImpl(IRData *rawData, uint16_t *dest, uint16_t maxLen,
-                                             std::integral_constant<int, 2>) {
-  if (!rawData) {
-    return 0;
-  }
-  return copyAndCompensateRawBuffer(rawData->rawbuf, rawData->rawlen, dest, maxLen);
-}
-
-static uint16_t compensateAndStoreLegacyImpl(IRData *, uint16_t *, uint16_t,
-                                             std::integral_constant<int, -1>) {
-  return 0;
-}
-
 template <typename Receiver>
 struct has_compensate_three_args {
  private:
@@ -410,8 +416,9 @@ struct has_compensate_two_args {
 }  // namespace detail
 
 static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16_t maxLen) {
-  using tag = std::integral_constant<int, detail::raw_access_mode<IRData>::value>;
-  return detail::compensateAndStoreLegacyImpl(rawData, dest, maxLen, tag{});
+  uint16_t rawLen = 0;
+  const uint16_t *rawBuf = detail::getRawBuffer(rawData, rawLen);
+  return detail::copyAndCompensateRawBuffer(rawBuf, rawLen, dest, maxLen);
 }
 
 template <typename Receiver>
