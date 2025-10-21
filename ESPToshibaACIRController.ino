@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
-#include <IRremote.hpp>     // Armin Joachimsmeyer IRremote
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <FS.h>
@@ -63,10 +62,10 @@ struct LearnedLineDetails {
 
 // ======================== Globální proměnné ========================
 WebServer server(80);
-static const int8_t IR_TX_PIN_DEFAULT = 3;   // ESP32-C3: např. 0 (přizpůsob dle zapojení)
+static const int8_t IR_TX_PIN_DEFAULT = 4;   // ESP32-C3: např. 4 (přizpůsob dle zapojení)
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_RX_PIN = 4;         // ESP32-C3: ověřené 4/5/10
-ToshibaACIR toshiba(IR_TX_PIN_DEFAULT);
+ToshibaACIR toshiba;
 static const uint8_t POWER_GND_PIN = -1 ;
 static const uint8_t POWER_VCC_PIN = -1 ;
 static const uint32_t DUP_FILTER_MS = 120;
@@ -1079,9 +1078,16 @@ static void printJSON(const IRData &d, const LearnedCode *learned) {
 // ======================== IR Sender init ========================
 
 static void initIrSender(int8_t pin) {
-  if (pin < 0) return;
-  IrSender.begin(pin, DISABLE_LED_FEEDBACK, true);
-  Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(pin);
+  g_irTxPin = pin;
+  toshiba.setSendPin(g_irTxPin);
+#if !defined(IR_SEND_PIN)
+  if (g_irTxPin < 0) {
+    Serial.println(F("[IR-TX] TX pin není nastaven, odesílání zakázáno."));
+    return;
+  }
+#endif
+  toshiba.begin();
+  Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(g_irTxPin);
 }
 
 static void configureAuxPowerPins() {
@@ -1299,12 +1305,10 @@ void setup() {
   g_showOnlyUnknown = prefs.getBool("only_unk", false);
 
   g_irTxPin = prefs.getInt("tx_pin", IR_TX_PIN_DEFAULT);
-  toshiba.setSendPin(g_irTxPin);
-  if (g_irTxPin >= 0) initIrSender(g_irTxPin);
+  initIrSender(g_irTxPin);
 
   wifiSetupWithWiFiManager();
   startWebServer();
-  toshiba.begin();
 
   // IR přijímač
   IrReceiver.begin(IR_RX_PIN, DISABLE_LED_FEEDBACK);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include "ToshibaAC.h"
 
 // ====== Web UI / API (vylepšené, bez reloadů) ======
 //
@@ -17,6 +18,7 @@
 // - extern String jsonEscape(const String&);
 // - extern const __FlashStringHelper* protoName(decode_type_t);
 // - extern bool isEffectivelyUnknown(const IREvent& e);
+extern ToshibaACIR toshiba;
 // - struct LearnedCode { uint32_t value, addr; uint8_t bits, flags; String proto,vendor,function,remote; };
 // - extern const LearnedCode* getLearnedByIndex(int idx);
 // - extern bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags,
@@ -113,6 +115,47 @@ inline void handleRoot() {
           "<span class='label'>Stáří:</span><span id='sendAge'>–</span>"
         "</div>"
       "</div>"
+      "<div class='card'>"
+        "<h3>Toshiba IR</h3>"
+        "<div class='row' style='gap:12px'>"
+          "<label style='display:flex;flex-direction:column;font-size:13px'>Power"
+            "<select id='toshiba-power' style='margin-top:4px'>"
+              "<option value='1'>On</option>"
+              "<option value='0'>Off</option>"
+            "</select>"
+          "</label>"
+          "<label style='display:flex;flex-direction:column;font-size:13px'>Režim"
+            "<select id='toshiba-mode' style='margin-top:4px'>"
+              "<option value='auto'>Auto</option>"
+              "<option value='cool'>Cool</option>"
+              "<option value='heat'>Heat</option>"
+              "<option value='dry'>Dry</option>"
+              "<option value='fan'>Fan</option>"
+            "</select>"
+          "</label>"
+        "</div>"
+        "<div class='row' style='gap:12px;align-items:center;margin-top:10px'>"
+          "<label style='display:flex;flex-direction:column;font-size:13px;min-width:90px'>Teplota"
+            "<span id='toshiba-temp-val' class='mono' style='font-weight:600;margin-top:4px'>24 °C</span>"
+          "</label>"
+          "<input type='range' id='toshiba-temp' min='17' max='30' value='24' style='flex:1'>"
+        "</div>"
+        "<div class='row' style='gap:12px;margin-top:10px'>"
+          "<label style='display:flex;flex-direction:column;font-size:13px'>Ventilátor"
+            "<select id='toshiba-fan' style='margin-top:4px'>"
+              "<option value='auto'>Auto</option>"
+              "<option value='1'>1</option>"
+              "<option value='2'>2</option>"
+              "<option value='3'>3</option>"
+              "<option value='4'>4</option>"
+              "<option value='5'>5</option>"
+            "</select>"
+          "</label>"
+        "</div>"
+        "<div class='row' style='justify-content:flex-end;margin-top:12px'>"
+          "<button id='toshiba-send' class='btn'>Odeslat</button>"
+        "</div>"
+      "</div>"
     "</div>"
   );
 
@@ -168,6 +211,12 @@ inline void handleRoot() {
     "const sendPulses=document.getElementById('sendPulses');"
     "const sendFreq=document.getElementById('sendFreq');"
     "const sendAge=document.getElementById('sendAge');"
+    "const toshPower=document.getElementById('toshiba-power');"
+    "const toshMode=document.getElementById('toshiba-mode');"
+    "const toshTemp=document.getElementById('toshiba-temp');"
+    "const toshTempVal=document.getElementById('toshiba-temp-val');"
+    "const toshFan=document.getElementById('toshiba-fan');"
+    "const toshSend=document.getElementById('toshiba-send');"
     "let state={onlyUnknown:false,tx:0};"
     "function showToast(msg,ok=true){toast.textContent=msg;toast.className=ok?'ok':'err';toast.style.display='block';setTimeout(()=>toast.style.display='none',2000)}"
     "function toHex(n){return '0x'+(Number(n)>>>0).toString(16).toUpperCase()}"
@@ -176,6 +225,10 @@ inline void handleRoot() {
     "cancelBtn.onclick=()=>{modal.style.display='none'};"
     "modal.addEventListener('click',e=>{if(e.target===modal)modal.style.display='none'});"
     "rawSendBtn.onclick=async()=>{rawSendBtn.disabled=true;let rep=parseInt(rawRepeat.value||'0',10);if(isNaN(rep))rep=0;rep=Math.max(0,Math.min(3,rep));try{const r=await fetch('/api/raw_send?repeat='+rep);const j=await r.json();if(j.ok){showToast('RAW odeslán.');}else{showToast(j.err||'Odeslání RAW selhalo',false);}}catch(err){showToast('Chyba odeslání RAW',false);}rawSendBtn.disabled=false;loadDiag();};"
+
+    "const syncToshibaTemp=()=>{if(toshTemp&&toshTempVal)toshTempVal.textContent=toshTemp.value+' °C';};"
+    "if(toshTemp){toshTemp.addEventListener('input',syncToshibaTemp);syncToshibaTemp();}"
+    "if(toshSend){toshSend.onclick=async()=>{toshSend.disabled=true;try{const params=new URLSearchParams();params.set('power',toshPower?toshPower.value:'1');params.set('mode',toshMode?toshMode.value:'auto');params.set('temp',toshTemp?toshTemp.value:'24');params.set('fan',toshFan?toshFan.value:'auto');const resp=await fetch('/api/toshiba_send?'+params.toString());let data=null;try{data=await resp.json();}catch(_){ }if(resp.ok&&data&&data.ok){showToast('Toshiba IR odesláno.');loadDiag();}else{const msg=data&&data.err?data.err:'Odeslání Toshiba IR selhalo';showToast(msg,false);}}catch(err){showToast('Chyba připojení',false);}toshSend.disabled=false;};}"
 
     // Uložení learned
     "form.onsubmit=async e=>{e.preventDefault();"
@@ -299,9 +352,8 @@ inline void handleSettingsPost() {
     int np = strtol(server.arg("tx_pin").c_str(), nullptr, 10);
     if (np >= 0 && np <= 19) {
       if (np != g_irTxPin) {
-        g_irTxPin = (int8_t)np;
-        prefs.putInt("tx_pin", g_irTxPin);
-        initIrSender(g_irTxPin);
+        prefs.putInt("tx_pin", (int8_t)np);
+        initIrSender((int8_t)np);
       }
     }
   }
@@ -630,6 +682,50 @@ inline void handleApiDiag() {
   server.send(200, "application/json", buildDiagnosticsJson());
 }
 
+inline void handleApiToshibaSend() {
+  ToshibaACIR::State s;
+  s.powerOn = true;
+  s.mode = ToshibaACIR::Mode::AUTO;
+  s.tempC = 24;
+  s.fan = ToshibaACIR::Fan::AUTO;
+
+  if (server.hasArg("power")) {
+    s.powerOn = (server.arg("power") != "0");
+  }
+  if (server.hasArg("mode")) {
+    String m = server.arg("mode");
+    m.toLowerCase();
+    if (m == "auto") s.mode = ToshibaACIR::Mode::AUTO;
+    else if (m == "cool") s.mode = ToshibaACIR::Mode::COOL;
+    else if (m == "heat") s.mode = ToshibaACIR::Mode::HEAT;
+    else if (m == "dry") s.mode = ToshibaACIR::Mode::DRY;
+    else if (m == "fan") s.mode = ToshibaACIR::Mode::AUTO;
+  }
+  if (server.hasArg("temp")) {
+    long t = strtol(server.arg("temp").c_str(), nullptr, 10);
+    if (t < 17) t = 17;
+    if (t > 30) t = 30;
+    s.tempC = static_cast<uint8_t>(t);
+  }
+  if (server.hasArg("fan")) {
+    String f = server.arg("fan");
+    f.toLowerCase();
+    if (f == "auto") s.fan = ToshibaACIR::Fan::AUTO;
+    else if (f == "1") s.fan = ToshibaACIR::Fan::F1;
+    else if (f == "2") s.fan = ToshibaACIR::Fan::F2;
+    else if (f == "3") s.fan = ToshibaACIR::Fan::F3;
+    else if (f == "4") s.fan = ToshibaACIR::Fan::F4;
+    else if (f == "5") s.fan = ToshibaACIR::Fan::F5;
+  }
+
+  bool ok = toshiba.send(s);
+  if (ok) {
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(500, "application/json", "{\"ok\":false,\"err\":\"toshiba send failed\"}");
+  }
+}
+
 inline void handleApiRawSend() {
   uint8_t repeats = 0;
   if (server.hasArg("repeat")) {
@@ -664,6 +760,7 @@ inline void startWebServer() {
   server.on("/api/send", handleApiSend);
   server.on("/api/history_send", handleApiHistorySend);
   server.on("/api/diag", handleApiDiag);
+  server.on("/api/toshiba_send", handleApiToshibaSend);
   server.on("/api/raw_send", handleApiRawSend);
   server.on("/api/raw_dump", handleApiRawDump);
 
