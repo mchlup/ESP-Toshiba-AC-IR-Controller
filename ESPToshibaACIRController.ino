@@ -1196,7 +1196,6 @@ String buildDiagnosticsJson() {
   out += F(",\"freq\":"); out += static_cast<uint32_t>(g_lastSendFreq);
   out += F(",\"pulses\":"); out += static_cast<uint32_t>(g_lastSendPulses);
   out += F("}}");
-  out += F("}");
   return out;
 }
 
