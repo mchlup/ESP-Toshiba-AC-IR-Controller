@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <ctype.h>
 #include <algorithm>
+#include <type_traits>
+#include <utility>
 #include "ToshibaAC.h"
 
 // ======================== Datové typy a pomocné struktury ========================
@@ -198,6 +200,122 @@ volatile uint32_t g_isrLastEdgeUs = 0;
 volatile int      g_isrLastLevel = -1;  // -1 = neumíme
 volatile bool     g_isrFrameReady = false;
 static uint16_t   g_rawScratch[RAW_MAX_PULSES];
+
+// ======================== IRremote kompatibilita ========================
+
+template <typename Sender>
+auto irSenderBeginDispatch(Sender &sender, uint_fast8_t pin, int)
+    -> decltype(sender.begin(pin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN, true), void()) {
+  sender.begin(pin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN, true);
+}
+
+template <typename Sender>
+auto irSenderBeginDispatch(Sender &sender, uint_fast8_t pin, long)
+    -> decltype(sender.begin(pin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN), void()) {
+  sender.begin(pin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN);
+}
+
+template <typename Sender>
+void irSenderBeginDispatch(Sender &sender, uint_fast8_t pin, ... ) {
+  sender.begin(pin);
+}
+
+static inline void irSenderBeginCompat(uint_fast8_t pin) {
+  irSenderBeginDispatch(IrSender, pin, 0);
+}
+
+template <typename Receiver>
+auto setReceiveToleranceDispatch(Receiver &receiver, uint8_t tolerance, int)
+    -> decltype(receiver.setReceiveTolerance(tolerance), void()) {
+  receiver.setReceiveTolerance(tolerance);
+}
+
+template <typename Receiver>
+void setReceiveToleranceDispatch(Receiver &, uint8_t, long) {}
+
+static inline void setReceiveToleranceCompat(uint8_t tolerance) {
+  setReceiveToleranceDispatch(IrReceiver, tolerance, 0);
+}
+
+template <typename Receiver>
+auto setUnknownThresholdDispatch(Receiver &receiver, uint8_t threshold, int)
+    -> decltype(receiver.setUnknownThreshold(threshold), void()) {
+  receiver.setUnknownThreshold(threshold);
+}
+
+template <typename Receiver>
+void setUnknownThresholdDispatch(Receiver &, uint8_t, long) {}
+
+static inline void setUnknownThresholdCompat(uint8_t threshold) {
+  setUnknownThresholdDispatch(IrReceiver, threshold, 0);
+}
+
+template <typename Receiver>
+auto compensateAndStoreDispatch(Receiver &receiver, uint16_t *dest, uint16_t maxLen, int)
+    -> decltype(receiver.compensateAndStoreIRResultInArray(dest, maxLen)) {
+  return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
+}
+
+static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16_t maxLen) {
+  if (!rawData || !rawData->rawDataPtr) {
+    return 0;
+  }
+
+  const auto *rawBuf = rawData->rawDataPtr->rawbuf;
+  uint16_t rawLen = rawData->rawDataPtr->rawlen;
+  if (rawLen > maxLen) {
+    rawLen = maxLen;
+  }
+
+#if defined(MARK_EXCESS_MICROS)
+  const int32_t markExcess = MARK_EXCESS_MICROS;
+#elif defined(MARK_EXCESS)
+  const int32_t markExcess = MARK_EXCESS;
+#else
+  const int32_t markExcess = 0;
+#endif
+
+  for (uint16_t i = 0; i < rawLen; ++i) {
+    uint32_t usec = static_cast<uint32_t>(rawBuf[i]) * MICROS_PER_TICK;
+    if ((i & 1U) == 0U) {
+      // MARK
+      if (markExcess >= 0) {
+        usec += static_cast<uint32_t>(markExcess);
+      } else if (usec > static_cast<uint32_t>(-markExcess)) {
+        usec -= static_cast<uint32_t>(-markExcess);
+      } else {
+        usec = 0;
+      }
+    } else {
+      // SPACE
+      if (markExcess >= 0) {
+        if (usec > static_cast<uint32_t>(markExcess)) {
+          usec -= static_cast<uint32_t>(markExcess);
+        } else {
+          usec = 0;
+        }
+      } else {
+        usec += static_cast<uint32_t>(-markExcess);
+      }
+    }
+
+    if (usec > 0xFFFFU) {
+      usec = 0xFFFFU;
+    }
+    dest[i] = static_cast<uint16_t>(usec);
+  }
+
+  return rawLen;
+}
+
+template <typename Receiver>
+uint16_t compensateAndStoreDispatch(Receiver &receiver, uint16_t *dest, uint16_t maxLen, long) {
+  return compensateAndStoreLegacy(&receiver.decodedIRData, dest, maxLen);
+}
+
+static inline uint16_t compensateAndStoreCompat(uint16_t *dest, uint16_t maxLen) {
+  return compensateAndStoreDispatch(IrReceiver, dest, maxLen, 0);
+}
 
 // Pomocné: bezpečné čtení micros v ISR/loop
 static inline uint32_t micros_safe() { return micros(); }
@@ -1139,7 +1257,7 @@ static void initIrSender(int8_t pin) {
 #endif
   // Inicializuj i globální instanci IrSender používanou pro přehrávání naučených kódů.
   // Bez explicitního begin() zůstane neaktivní a sendRaw()/sendNEC atd. nebudou nic vysílat.
-  IrSender.begin(g_irTxPin, ENABLE_LED_FEEDBACK, USE_DEFAULT_FEEDBACK_LED_PIN, true);
+  irSenderBeginCompat(g_irTxPin);
   toshiba.begin();
   Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(g_irTxPin);
 }
@@ -1163,7 +1281,7 @@ static void configureAuxPowerPins() {
 // ======================== Sběr RAW (IRremote) ========================
 static void captureLastRawFromReceiver() {
   uint16_t compensated[RAW_BUFFER_LENGTH];
-  uint16_t len = IrReceiver.compensateAndStoreIRResultInArray(compensated, RAW_BUFFER_LENGTH);
+  uint16_t len = compensateAndStoreCompat(compensated, RAW_BUFFER_LENGTH);
 
   if (len == 0) {
     g_lastRawValid = false;
@@ -1355,8 +1473,8 @@ void setup() {
 
   // IR přijímač
   IrReceiver.begin(IR_RX_PIN, ENABLE_LED_FEEDBACK);
-  IrReceiver.setReceiveTolerance(25);
-  IrReceiver.setUnknownThreshold(12);
+  setReceiveToleranceCompat(25);
+  setUnknownThresholdCompat(12);
   pinMode(IR_RX_PIN, INPUT_PULLUP);              // demodulátor většinou tahá do HIGH
   attachInterrupt(digitalPinToInterrupt(IR_RX_PIN), irEdgeISR, CHANGE);
   Serial.println(F("[RAW] Sniffer aktivní (GPIO CHANGE ISR)."));
