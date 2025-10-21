@@ -92,6 +92,13 @@ static decode_type_t g_lastSendProto = UNKNOWN;
 static size_t   g_lastSendPulses = 0;
 static uint8_t  g_lastSendFreq = 0;
 
+static bool     g_lastDecodeValid = false;
+static uint32_t g_lastDecodeMs = 0;
+static decode_type_t g_lastDecodeProto = UNKNOWN;
+static uint8_t  g_lastDecodeBits = 0;
+static uint32_t g_lastDecodePulseCount = 0;
+static String   g_lastDecodeSource = F("(none)");
+
 // Soubor pro RAW: /learned/raw_<index>.bin  (binárně: [1B khz][2B len LE][2B*len pulzy])
 static String rawPathForIndex(size_t index) {
   String p = F("/learned/raw_");
@@ -263,6 +270,18 @@ static void recordSendDiagnostics(bool ok, const String &method,
   g_lastSendProto = proto;
   g_lastSendPulses = pulses;
   g_lastSendFreq = freqKhz;
+}
+
+void recordIrTxDiagnostics(bool ok, decode_type_t proto, size_t pulses,
+                           uint8_t freqKhz,
+                           const __FlashStringHelper* methodLabel) {
+  String label;
+  if (methodLabel) {
+    label = String(methodLabel);
+  } else {
+    label = F("external");
+  }
+  recordSendDiagnostics(ok, label, proto, pulses, freqKhz);
 }
 
 // ======================== Deklarace funkcí ========================
@@ -734,6 +753,8 @@ bool fsAppendLearned(uint32_t value, uint8_t bits, uint32_t addr, uint32_t flags
       g_lastRawValid = false;
       g_lastRawSource = F("(uloženo)");
       g_lastRaw.clear();
+      g_lastDecodeSource = g_lastRawSource;
+      g_lastDecodePulseCount = 0;
     }
   }
 
@@ -1150,6 +1171,17 @@ String buildDiagnosticsJson() {
     out += F("]");
     out += F(",\"preview_truncated\":false");
   }
+  out += F(",\"decode_valid\":"); out += g_lastDecodeValid ? "true" : "false";
+  out += F(",\"decode_age_ms\":");
+  if (g_lastDecodeValid) {
+    out += static_cast<uint32_t>(millis() - g_lastDecodeMs);
+  } else {
+    out += 0;
+  }
+  out += F(",\"decode_proto\":\""); out += jsonEscape(String(protoName(g_lastDecodeProto))); out += F("\"");
+  out += F(",\"decode_bits\":"); out += static_cast<uint32_t>(g_lastDecodeBits);
+  out += F(",\"decode_len\":"); out += g_lastDecodePulseCount;
+  out += F(",\"decode_source\":\""); out += jsonEscape(g_lastDecodeSource); out += F("\"");
   out += F("},\"send\":{");
   out += F("\"valid\":"); out += g_lastSendValid ? "true" : "false";
   out += F(",\"ok\":"); out += g_lastSendOk ? "true" : "false";
@@ -1267,6 +1299,18 @@ void loop() {
     printJSON(d, learned);
     addToHistory(d, learnedIndex);
     captureLastRawFromReceiver();
+
+    g_lastDecodeValid = true;
+    g_lastDecodeMs = now;
+    g_lastDecodeProto = d.protocol;
+    g_lastDecodeBits = d.numberOfBits;
+    if (g_lastRawValid && !g_lastRaw.empty()) {
+      g_lastDecodePulseCount = g_lastRaw.size();
+      g_lastDecodeSource = g_lastRawSource;
+    } else {
+      g_lastDecodePulseCount = 0;
+      g_lastDecodeSource = F("decoder");
+    }
   }
 
   lastMs   = now;
