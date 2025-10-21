@@ -661,35 +661,41 @@ String fsReadLearnedAsArrayJSON() {
   File f = LittleFS.open(LEARN_FILE, FILE_READ);
   if (!f) return "[]";
 
-  // Načti celý soubor a oprav nalepené objekty
-  String content = f.readString();  // může obsahovat \r\n, \n, nebo žádný newline
-  f.close();
-
-  // 1) Vlož čárku mezi '}{' (dva JSON objekty slepené bez oddělovače)
-  //    Ošetříme i varianty s bílými znaky: '}\n{' apod. necháváme být – ty jsou OK.
-  for (;;) {
-    int pos = content.indexOf(F("}{"));
-    if (pos < 0) break;
-    content = content.substring(0, pos + 1) + F(",") + content.substring(pos + 1);
-  }
-
-  // 2) Rozsekej na řádky a poskládej jako správné pole
-  String out = "[";
+  String out;
+  out.reserve(256);
+  out += '[';
   bool first = true;
-  int start = 0;
-  while (start < (int)content.length()) {
-    int end = content.indexOf('\n', start);
-    if (end < 0) end = content.length();
-    String line = content.substring(start, end);
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
     line.trim();
-    if (line.length()) {
-      if (!first) out += ',';
+    if (!line.length()) continue;
+
+    int start = 0;
+    while (start < line.length()) {
+      int glued = line.indexOf(F("}{"), start);
+      String chunk;
+      if (glued >= 0) {
+        chunk = line.substring(start, glued + 1);
+        start = glued + 1;
+      } else {
+        chunk = line.substring(start);
+        start = line.length();
+      }
+
+      chunk.trim();
+      if (!chunk.length()) continue;
+
+      if (!first) {
+        out += ',';
+      }
+      out += chunk;
       first = false;
-      out += line;
     }
-    start = end + 1;
   }
-  out += "]";
+
+  f.close();
+  out += ']';
   return out;
 }
 
