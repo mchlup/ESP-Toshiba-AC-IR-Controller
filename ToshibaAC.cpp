@@ -5,7 +5,13 @@
 #define DISABLE_CODE_FOR_RECEIVER
 
 #include <Arduino.h>
-#include <IRremote.hpp>
+
+// Vyhneme se přímému includu <IRremote.hpp>, aby se definice globálních symbolů
+// IRremote (timerEnableReceiveInterrupt, IrSender, ...) negenerovaly i v této
+// překladové jednotce. Stačí nám pouze dopředná deklarace typů použitých v
+// signatuře weak funkce níže.
+enum decode_type_t : uint16_t;
+class __FlashStringHelper;
 
 // Volitelná diagnostika – je-li definována v projektu, použije se.
 // (weak symbol, aby kompilace prošla i bez implementace v .ino / WebUI)
