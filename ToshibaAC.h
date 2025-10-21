@@ -26,6 +26,11 @@ public:
     uint8_t  tempC     = 23;   // 17..30
   };
 
+  // Toshiba AC rámec
+  static constexpr size_t   kFrameBytes       = 9;
+  static constexpr uint16_t kBitsPerFrame     = 72;
+  static_assert(kBitsPerFrame == kFrameBytes * 8, "Toshiba AC rámec musí mít 72 bitů");
+
   // Timing (Samsung-like)
   static constexpr uint16_t kCarrierKhz      = 38;
   static constexpr uint16_t HDR_MARK_US      = 4500;
@@ -34,26 +39,34 @@ public:
   static constexpr uint16_t ONE_SPACE_US     = 1600;
   static constexpr uint16_t ZERO_SPACE_US    = 560;
   static constexpr uint16_t FRAME_GAP_US     = 5000; // mezera mezi 2×72b (bez nosné)
+  static constexpr size_t   kFramePulseCount = 2 + (kBitsPerFrame * 2) + 1; // hlavička + bity + závěr
+  static constexpr size_t   kTotalPulseCount = (kFramePulseCount * 2) + 1;   // dva rámce + mezera
+  static constexpr size_t   kRawBufferLen    = kTotalPulseCount + 10;        // rezerva
 
-  explicit ToshibaACIR(uint8_t irSendPin) : _pin(irSendPin) {}
+  explicit ToshibaACIR(int8_t irSendPin = -1) : _pin(irSendPin) {}
+
+  void setSendPin(int8_t irSendPin) { _pin = irSendPin; }
+  int8_t sendPin() const { return _pin; }
 
   void begin() {
 #if defined(IR_SEND_PIN)
     // Pokud je IRremote zkonfigurován přes IR_SEND_PIN, nastaví se sám.
 #else
-    IrSender.begin(_pin, ENABLE_LED_FEEDBACK);
+    if (_pin >= 0) {
+      IrSender.begin(_pin, ENABLE_LED_FEEDBACK);
+    }
 #endif
   }
 
   // Vytvoří a odešle příkaz podle stavu
   bool send(const State &s) {
-    uint8_t frame[9];
+    uint8_t frame[kFrameBytes];
     buildFrame(s, frame);
     return sendFrameTwice(frame);
   }
 
   // Utilita: sestavení rámce do bufferu (9 bajtů)
-  static void buildFrame(const State &s, uint8_t out[9]) {
+  static void buildFrame(const State &s, uint8_t out[kFrameBytes]) {
     out[0] = 0xF2;
     out[1] = 0x0D;
     out[2] = 0x03;
@@ -81,17 +94,21 @@ public:
   }
 
 private:
-  uint8_t _pin;
+  int8_t _pin;
 
   // Sestaví RAW pulzy pro 72b a pošle je 2×
-  bool sendFrameTwice(const uint8_t frame[9]) {
-    // 72 bitů + úvodní hlavička + koncový MARK
-    // Každý bit = MARK + (SPACE_0/1). Pulzů bude ~ (1 + 72)*2 + hlavičky atd.
-    constexpr size_t MAX_PULSES = 2 * (1 + 72) * 2 + 20;
-    static uint16_t raw[MAX_PULSES];
+  bool sendFrameTwice(const uint8_t frame[kFrameBytes]) {
+#if !defined(IR_SEND_PIN)
+    if (_pin < 0) {
+      recordIrTxDiagnostics(false, UNKNOWN, 0, kCarrierKhz, F("toshiba-ac"));
+      return false;
+    }
+#endif
+
+    static uint16_t raw[kRawBufferLen];
     size_t n = 0;
 
-    auto emitHeader = [&]() {
+    auto emitHeader = [&](void) {
       raw[n++] = HDR_MARK_US;
       raw[n++] = HDR_SPACE_US;
     };
@@ -99,14 +116,13 @@ private:
       raw[n++] = BIT_MARK_US;
       raw[n++] = one ? ONE_SPACE_US : ZERO_SPACE_US;
     };
-    auto emitTrailMark = [&]() {
+    auto emitTrailMark = [&](void) {
       raw[n++] = BIT_MARK_US; // závěrečný mark (běžné u NEC/Samsung stylu)
     };
 
-    // jeden 72b rámec
     auto encode72 = [&](const uint8_t *b) {
       emitHeader();
-      for (int i = 0; i < 9; ++i) {
+      for (size_t i = 0; i < kFrameBytes; ++i) {
         uint8_t val = b[i];
         // MSB-first (podle publikovaných analyzovaných rámců)
         for (int bit = 7; bit >= 0; --bit) {
@@ -116,16 +132,16 @@ private:
       emitTrailMark();
     };
 
-    // 1. průchod
     encode72(frame);
-    // vlož „ticho“ (mezera) mezi duplikovanými rámci
     raw[n++] = FRAME_GAP_US;    // mezera bez nosné (SPACE)
-
-    // 2. průchod
     encode72(frame);
 
-    // Odeslat RAW (páry: MARK/SPACE; 38 kHz)
-    IrSender.sendRaw(raw, (uint_fast8_t)n, kCarrierKhz);
+    if (n > kRawBufferLen) {
+      recordIrTxDiagnostics(false, UNKNOWN, n, kCarrierKhz, F("toshiba-ac"));
+      return false;
+    }
+
+    IrSender.sendRaw(raw, static_cast<uint16_t>(n), kCarrierKhz);
     recordIrTxDiagnostics(true, UNKNOWN, n, kCarrierKhz, F("toshiba-ac"));
     return true;
   }
