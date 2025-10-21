@@ -65,9 +65,8 @@ struct LearnedLineDetails {
 WebServer server(80);
 static const int8_t IR_TX_PIN_DEFAULT = 3;   // ESP32-C3: např. 0 (přizpůsob dle zapojení)
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
-static const uint8_t IR_TX_PIN = g_irTxPin;   // uprav dle zapojení
 static const uint8_t IR_RX_PIN = 4;         // ESP32-C3: ověřené 4/5/10
-ToshibaACIR toshiba(IR_TX_PIN);
+ToshibaACIR toshiba(IR_TX_PIN_DEFAULT);
 static const uint8_t POWER_GND_PIN = -1 ;
 static const uint8_t POWER_VCC_PIN = -1 ;
 static const uint32_t DUP_FILTER_MS = 120;
@@ -1273,6 +1272,7 @@ void setup() {
   g_showOnlyUnknown = prefs.getBool("only_unk", false);
 
   g_irTxPin = prefs.getInt("tx_pin", IR_TX_PIN_DEFAULT);
+  toshiba.setSendPin(g_irTxPin);
   if (g_irTxPin >= 0) initIrSender(g_irTxPin);
 
   wifiSetupWithWiFiManager();
