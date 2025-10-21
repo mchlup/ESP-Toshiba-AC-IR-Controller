@@ -62,7 +62,6 @@ Status sekce průběžně informuje o stavu připojení, posledním naučeném k
 - Učení se automaticky ukončí po uplynutí nastaveného limitu (výchozí 60 s), pokud není zachycen žádný kód.
 - Kódy známých protokolů jsou ukládány společně se surovými daty, takže je možné je reprodukovat i pro neznámé protokoly.
 
-
 ## Toshiba IR control (ESP32-C3 + IRremote 3.3.2)
 
 Tento firmware obsahuje nativní vysílání IR kódů pro klimatizace Toshiba (kompaktní 72bit rámec). Pro správnou funkci:
