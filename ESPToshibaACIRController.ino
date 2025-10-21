@@ -77,6 +77,7 @@ static const size_t HISTORY_LEN = 10;
 static IREvent history[HISTORY_LEN];
 static size_t histWrite = 0;
 static size_t histCount = 0;
+static const uint32_t RAW_EVENT_MATCH_WINDOW_MS = 250;
 static std::vector<uint16_t> g_lastRaw;
 static uint8_t  g_lastRawKhz = 38;   // default
 static bool     g_lastRawValid = false;
@@ -404,12 +405,29 @@ static decode_type_t parseProtoLabelRelaxed(const String &sIn) {
 static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
                               const std::vector<uint16_t>* rawOpt = nullptr,
                               uint8_t rawKhz = 38) {
-  const decode_type_t t = parseProtoLabelRelaxed(e.proto.length() ? e.proto : String(F("UNKNOWN")));
-
   auto doRepeats = [&](auto &&fnOnce){
     for (uint8_t r=0; r<=repeats; r++){ fnOnce(); delay(40); }
     return true;
   };
+
+  const bool hasRaw = rawOpt && !rawOpt->empty();
+  const uint8_t rawFreq = rawKhz ? rawKhz : 38;
+
+  if (hasRaw) {
+    IrSender.sendRaw(rawOpt->data(), static_cast<uint16_t>(rawOpt->size()), rawFreq);
+    for (uint8_t r = 0; r < repeats; r++) {
+      delay(60);
+      IrSender.sendRaw(rawOpt->data(), static_cast<uint16_t>(rawOpt->size()), rawFreq);
+    }
+    if (rawOpt == &g_lastRaw) {
+      recordSendDiagnostics(true, F("raw-capture"), UNKNOWN, rawOpt->size(), rawFreq);
+    } else {
+      recordSendDiagnostics(true, F("raw-storage"), UNKNOWN, rawOpt->size(), rawFreq);
+    }
+    return true;
+  }
+
+  const decode_type_t t = parseProtoLabelRelaxed(e.proto.length() ? e.proto : String(F("UNKNOWN")));
 
   // 1) nativní protokoly (když je známý label)
   switch (t) {
@@ -455,19 +473,7 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
     default: break;
   }
 
-  // 2) RAW fallback – když je uložený
-  if (rawOpt && !rawOpt->empty()) {
-    IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz);
-    for (uint8_t r=0; r<repeats; r++){ delay(60); IrSender.sendRaw(rawOpt->data(), (uint16_t)rawOpt->size(), rawKhz); }
-    if (rawOpt == &g_lastRaw) {
-      recordSendDiagnostics(true, F("raw-capture"), t, rawOpt->size(), rawKhz);
-    } else {
-      recordSendDiagnostics(true, F("raw-storage"), t, rawOpt->size(), rawKhz);
-    }
-    return true;
-  }
-
-  // 3) HEURISTICKÝ FALLBACK pro UNKNOWN bez RAW
+  // 2) HEURISTICKÝ FALLBACK pro UNKNOWN bez RAW
 switch (e.bits) {
   case 32:
     // 32 b je nejčastěji NEC – zkus jen NEC (ať se přijímač zbytečně nechytačí na ONKYO/Kaseikyo)
@@ -508,7 +514,7 @@ switch (e.bits) {
     }
     break;
 }
-recordSendDiagnostics(false, F("fallback-failed"), t, rawOpt ? rawOpt->size() : 0, rawKhz);
+recordSendDiagnostics(false, F("fallback-failed"), t, 0, rawFreq);
 return false;
 }
 
@@ -1176,7 +1182,28 @@ bool irSendEvent(const IREvent &ev, uint8_t repeats) {
   tmp.addr  = ev.address;
   tmp.proto = String(protoName(ev.proto));
 
-  return irSendLearnedCore(tmp, repeats, nullptr, 38);
+  std::vector<uint16_t> rawFromStorage;
+  uint8_t rawFreq = 38;
+  const std::vector<uint16_t>* rawPtr = nullptr;
+
+  int16_t storedIdx = findLearnedIndex(ev.value, ev.bits, ev.address);
+  if (storedIdx >= 0) {
+    if (fsLoadRawForIndex(static_cast<size_t>(storedIdx), rawFromStorage, rawFreq) && !rawFromStorage.empty()) {
+      rawPtr = &rawFromStorage;
+    }
+  }
+
+  if (!rawPtr && g_lastRawValid) {
+    uint32_t diff = (ev.ms > g_lastRawCaptureMs)
+                      ? (ev.ms - g_lastRawCaptureMs)
+                      : (g_lastRawCaptureMs - ev.ms);
+    if (diff <= RAW_EVENT_MATCH_WINDOW_MS) {
+      rawPtr = &g_lastRaw;
+      rawFreq = g_lastRawKhz;
+    }
+  }
+
+  return irSendLearnedCore(tmp, repeats, rawPtr, rawFreq);
 }
 
 String buildDiagnosticsJson() {
