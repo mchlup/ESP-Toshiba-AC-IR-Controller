@@ -1084,6 +1084,9 @@ static void initIrSender(int8_t pin) {
     return;
   }
 #endif
+  // Inicializuj i globální instanci IrSender používanou pro přehrávání naučených kódů.
+  // Bez explicitního begin() zůstane neaktivní a sendRaw()/sendNEC atd. nebudou nic vysílat.
+  IrSender.begin(g_irTxPin);
   toshiba.begin();
   Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(g_irTxPin);
 }
