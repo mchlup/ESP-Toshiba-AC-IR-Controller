@@ -77,8 +77,8 @@ static const int8_t IR_TX_PIN_DEFAULT = 3;   // ESP32-C3: např. 4 (přizpůsob 
 static int8_t g_irTxPin = IR_TX_PIN_DEFAULT;
 static const uint8_t IR_RX_PIN = 4;         // ESP32-C3: ověřené 4/5/10
 ToshibaACIR toshiba;
-static const uint8_t POWER_GND_PIN = -1 ;
-static const uint8_t POWER_VCC_PIN = -1 ;
+static const int8_t POWER_GND_PIN = -1;
+static const int8_t POWER_VCC_PIN = -1;
 static const uint32_t DUP_FILTER_MS = 120;
 Preferences prefs;                 // NVS namespace: "irrecv"
 static const char* LEARN_FILE = "/learned.jsonl";
@@ -421,26 +421,36 @@ static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16
   return detail::copyAndCompensateRawBuffer(rawBuf, rawLen, dest, maxLen);
 }
 
-template <typename Receiver>
-typename std::enable_if<detail::has_compensate_three_args<Receiver>::value, uint16_t>::type
-compensateAndStoreDispatch(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
-  return receiver.compensateAndStoreIRResultInArray(dest, maxLen, false);
-}
+template <typename Receiver, bool HasThreeArgs, bool HasTwoArgs>
+struct compensate_dispatch;
+
+template <typename Receiver, bool HasTwoArgs>
+struct compensate_dispatch<Receiver, true, HasTwoArgs> {
+  static uint16_t apply(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
+    return receiver.compensateAndStoreIRResultInArray(dest, maxLen, false);
+  }
+};
 
 template <typename Receiver>
-typename std::enable_if<!detail::has_compensate_three_args<Receiver>::value &&
-                            detail::has_compensate_two_args<Receiver>::value,
-                        uint16_t>::type
-compensateAndStoreDispatch(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
-  return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
-}
+struct compensate_dispatch<Receiver, false, true> {
+  static uint16_t apply(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
+    return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
+  }
+};
 
 template <typename Receiver>
-typename std::enable_if<!detail::has_compensate_three_args<Receiver>::value &&
-                            !detail::has_compensate_two_args<Receiver>::value,
-                        uint16_t>::type
-compensateAndStoreDispatch(Receiver &, IRData *rawData, uint16_t *dest, uint16_t maxLen) {
-  return compensateAndStoreLegacy(rawData, dest, maxLen);
+struct compensate_dispatch<Receiver, false, false> {
+  static uint16_t apply(Receiver &, IRData *rawData, uint16_t *dest, uint16_t maxLen) {
+    return compensateAndStoreLegacy(rawData, dest, maxLen);
+  }
+};
+
+template <typename Receiver>
+static uint16_t compensateAndStoreDispatch(Receiver &receiver, IRData *rawData, uint16_t *dest,
+                                           uint16_t maxLen) {
+  return compensate_dispatch<Receiver, detail::has_compensate_three_args<Receiver>::value,
+                             detail::has_compensate_two_args<Receiver>::value>::apply(
+      receiver, rawData, dest, maxLen);
 }
 
 static inline uint16_t compensateAndStoreCompat(uint16_t *dest, uint16_t maxLen) {
@@ -1392,20 +1402,33 @@ static void initIrSender(int8_t pin) {
   Serial.print(F("[IR-TX] Inicializován na pinu ")); Serial.println(g_irTxPin);
 }
 
+static inline bool isValidPin(int8_t pin) {
+  return pin >= 0;
+}
+
 static void configureAuxPowerPins() {
-  // Nejprve přepneme piny do známých stavů, abychom neovlivnili boot strapping.
-  pinMode(POWER_GND_PIN, INPUT);
-  pinMode(POWER_VCC_PIN, INPUT);
+  const bool gndValid = isValidPin(POWER_GND_PIN);
+  const bool vccValid = isValidPin(POWER_VCC_PIN);
 
-  digitalWrite(POWER_GND_PIN, LOW);
-  pinMode(POWER_GND_PIN, OUTPUT);
+  if (gndValid) {
+    // Nejprve přepneme piny do známých stavů, abychom neovlivnili boot strapping.
+    pinMode(static_cast<uint8_t>(POWER_GND_PIN), INPUT);
+    digitalWrite(static_cast<uint8_t>(POWER_GND_PIN), LOW);
+    pinMode(static_cast<uint8_t>(POWER_GND_PIN), OUTPUT);
+  }
 
-  digitalWrite(POWER_VCC_PIN, HIGH);
-  pinMode(POWER_VCC_PIN, OUTPUT);
+  if (vccValid) {
+    pinMode(static_cast<uint8_t>(POWER_VCC_PIN), INPUT);
+    digitalWrite(static_cast<uint8_t>(POWER_VCC_PIN), HIGH);
+    pinMode(static_cast<uint8_t>(POWER_VCC_PIN), OUTPUT);
+  }
 
-  Serial.print(F("[POWER] GND pin ")); Serial.print(POWER_GND_PIN);
-  Serial.print(F(", VCC pin ")); Serial.print(POWER_VCC_PIN);
-  Serial.println(F(" inicializovány."));
+  Serial.print(F("[POWER] GND pin "));
+  Serial.print(static_cast<int>(POWER_GND_PIN));
+  Serial.print(gndValid ? F(" inicializován") : F(" deaktivován"));
+  Serial.print(F(", VCC pin "));
+  Serial.print(static_cast<int>(POWER_VCC_PIN));
+  Serial.println(vccValid ? F(" inicializován.") : F(" deaktivován."));
 }
 
 // ======================== Sběr RAW (IRremote) ========================
