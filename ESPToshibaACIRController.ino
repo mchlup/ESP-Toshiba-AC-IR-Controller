@@ -421,26 +421,36 @@ static uint16_t compensateAndStoreLegacy(IRData *rawData, uint16_t *dest, uint16
   return detail::copyAndCompensateRawBuffer(rawBuf, rawLen, dest, maxLen);
 }
 
-template <typename Receiver>
-typename std::enable_if<detail::has_compensate_three_args<Receiver>::value, uint16_t>::type
-compensateAndStoreDispatch(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
-  return receiver.compensateAndStoreIRResultInArray(dest, maxLen, false);
-}
+template <typename Receiver, bool HasThreeArgs, bool HasTwoArgs>
+struct compensate_dispatch;
+
+template <typename Receiver, bool HasTwoArgs>
+struct compensate_dispatch<Receiver, true, HasTwoArgs> {
+  static uint16_t apply(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
+    return receiver.compensateAndStoreIRResultInArray(dest, maxLen, false);
+  }
+};
 
 template <typename Receiver>
-typename std::enable_if<!detail::has_compensate_three_args<Receiver>::value &&
-                            detail::has_compensate_two_args<Receiver>::value,
-                        uint16_t>::type
-compensateAndStoreDispatch(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
-  return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
-}
+struct compensate_dispatch<Receiver, false, true> {
+  static uint16_t apply(Receiver &receiver, IRData *, uint16_t *dest, uint16_t maxLen) {
+    return receiver.compensateAndStoreIRResultInArray(dest, maxLen);
+  }
+};
 
 template <typename Receiver>
-typename std::enable_if<!detail::has_compensate_three_args<Receiver>::value &&
-                            !detail::has_compensate_two_args<Receiver>::value,
-                        uint16_t>::type
-compensateAndStoreDispatch(Receiver &, IRData *rawData, uint16_t *dest, uint16_t maxLen) {
-  return compensateAndStoreLegacy(rawData, dest, maxLen);
+struct compensate_dispatch<Receiver, false, false> {
+  static uint16_t apply(Receiver &, IRData *rawData, uint16_t *dest, uint16_t maxLen) {
+    return compensateAndStoreLegacy(rawData, dest, maxLen);
+  }
+};
+
+template <typename Receiver>
+static uint16_t compensateAndStoreDispatch(Receiver &receiver, IRData *rawData, uint16_t *dest,
+                                           uint16_t maxLen) {
+  return compensate_dispatch<Receiver, detail::has_compensate_three_args<Receiver>::value,
+                             detail::has_compensate_two_args<Receiver>::value>::apply(
+      receiver, rawData, dest, maxLen);
 }
 
 static inline uint16_t compensateAndStoreCompat(uint16_t *dest, uint16_t maxLen) {
