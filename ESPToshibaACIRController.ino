@@ -1343,9 +1343,19 @@ void wifiSetupWithWiFiManager() {
   wm.setConfigPortalTimeout(180);
   String apName = makeApName();
   if (!wm.autoConnect(apName.c_str())) {
-    Serial.println(F("[NET] WiFi připojení selhalo, pokračuju bez sítě."));
+    Serial.println(F("[NET] WiFi připojení selhalo, přepínám na fallback AP."));
+
+    WiFi.mode(WIFI_AP_STA);
+    if (WiFi.softAP(apName.c_str())) {
+      IPAddress apIp = WiFi.softAPIP();
+      Serial.print(F("[NET] SoftAP aktivní: "));
+      Serial.println(apIp);
+    } else {
+      Serial.println(F("[NET] SoftAP spuštění selhalo – webserver zůstane offline."));
+    }
   } else {
-    Serial.print(F("[NET] Připojeno: ")); Serial.println(WiFi.localIP());
+    Serial.print(F("[NET] Připojeno: "));
+    Serial.println(WiFi.localIP());
   }
 }
 
