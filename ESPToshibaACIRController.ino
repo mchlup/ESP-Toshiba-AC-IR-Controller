@@ -445,16 +445,34 @@ struct compensate_dispatch<Receiver, false, false> {
   }
 };
 
-template <typename Receiver>
-static uint16_t compensateAndStoreDispatch(Receiver &receiver, IRData *rawData, uint16_t *dest,
-                                           uint16_t maxLen) {
-  return compensate_dispatch<Receiver, detail::has_compensate_three_args<Receiver>::value,
-                             detail::has_compensate_two_args<Receiver>::value>::apply(
-      receiver, rawData, dest, maxLen);
+// IRremote 3.3.2: délku si vezmeme z aktuálního rawlen v decodedIRData
+static uint16_t compensateAndStoreDispatch(uint8_t* dest8) {
+  // Zjisti, kolik položek má aktuální RAW (v tickech)
+  uint16_t rawLen = 0;
+  (void)detail::getRawBuffer(&IrReceiver.decodedIRData, rawLen); // už máš definované výše
+  if (rawLen == 0) return 0;
+
+  // Ulož kompenzované hodnoty do 8bit pole
+  IrReceiver.compensateAndStoreIRResultInArray(dest8);
+
+  // Délka odpovídá rawLen
+  return rawLen;
 }
 
-static inline uint16_t compensateAndStoreCompat(uint16_t *dest, uint16_t maxLen) {
-  return compensateAndStoreDispatch(IrReceiver, &IrReceiver.decodedIRData, dest, maxLen);
+// Zachováme kompatibilní název: vrací µs v 16bit poli (konverze z 8bit ticků)
+static uint16_t compensateAndStoreCompat(uint16_t *dest, uint16_t maxLen) {
+  if (!dest || maxLen == 0) return 0;
+  // dočasné 8bit pole pro ticky
+  uint8_t tmp8[RAW_BUFFER_LENGTH];
+  uint16_t n = compensateAndStoreDispatch(tmp8);
+  if (n > maxLen) n = maxLen;
+  for (uint16_t i = 0; i < n; ++i) {
+    // převod tick → µs (MICROS_PER_TICK definuje IRremote, obvykle 50)
+    uint32_t usec = (uint32_t)tmp8[i] * MICROS_PER_TICK;
+    if (usec > 0xFFFFU) usec = 0xFFFFU;
+    dest[i] = (uint16_t)usec;
+  }
+  return n;
 }
 
 // Pomocné: bezpečné čtení micros v ISR/loop
@@ -520,7 +538,7 @@ static void finalizeRawCapture(const uint16_t *src, uint16_t count,
   }
 
   if (g_lastRawValid) {
-    const uint16_t toCopy = std::min<uint16_t>(g_lastRaw.size(), RAW_BUFFER_LENGTH);
+    const uint16_t toCopy = std::min<uint16_t>((uint16_t)g_lastRaw.size(), (uint16_t)RAW_BUFFER_LENGTH);
     for (uint16_t i = 0; i < toCopy; ++i) {
       g_lastRawBuffer[i] = g_lastRaw[i];
     }
@@ -756,7 +774,7 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
       recordSendDiagnostics(true, F("proto-RC6"), t, 0, 0);
       return true;
     case JVC:
-      doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, (int)e.bits, false); });
+      doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, (int)16, false); });
       recordSendDiagnostics(true, F("proto-JVC"), t, 0, 0);
       return true;
     case LG:
@@ -782,48 +800,45 @@ static bool irSendLearnedCore(const LearnedCode &e, uint8_t repeats,
   }
 
   // 2) HEURISTICKÝ FALLBACK pro UNKNOWN bez RAW
-switch (e.bits) {
-  case 32:
-    // 32 b je nejčastěji NEC – zkus jen NEC (ať se přijímač zbytečně nechytačí na ONKYO/Kaseikyo)
-    if (doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, 32); })) {
-      recordSendDiagnostics(true, F("fallback-NEC"), NEC, 0, 0);
-      return true;
-    }
-
-    // volitelně Samsung jen pokud máme aspoň něco v addr/cmd (jinak to často „přepřekládá“ na ONKYO)
-    if (e.addr || (e.value & 0xFFFF)) {
-      uint16_t a = e.addr ? (uint16_t)e.addr : (uint16_t)(e.value >> 16);
-      uint16_t c = (uint16_t)(e.value & 0xFFFF);
-      if (doRepeats([&]{ IrSender.sendSamsung(a, c, 0); })) {
-        recordSendDiagnostics(true, F("fallback-SAMSUNG"), SAMSUNG, 0, 0);
+  switch (e.bits) {
+    case 32:
+      if (doRepeats([&]{ IrSender.sendNEC((unsigned long)e.value, 32); })) {
+        recordSendDiagnostics(true, F("fallback-NEC"), NEC, 0, 0);
         return true;
       }
-    }
-    break;
+      if (e.addr || (e.value & 0xFFFF)) {
+        uint16_t a = e.addr ? (uint16_t)e.addr : (uint16_t)(e.value >> 16);
+        uint16_t c = (uint16_t)(e.value & 0xFFFF);
+        if (doRepeats([&]{ IrSender.sendSamsung(a, c, 0); })) {
+          recordSendDiagnostics(true, F("fallback-SAMSUNG"), SAMSUNG, 0, 0);
+          return true;
+        }
+      }
+      break;
 
-  case 12: case 15:
-    if (doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); })) {
-      recordSendDiagnostics(true, F("fallback-SONY"), SONY, 0, 0);
-      return true;
-    }
-    break;
+    case 12: case 15:
+      if (doRepeats([&]{ IrSender.sendSony((unsigned long)e.value, (int)e.bits); })) {
+        recordSendDiagnostics(true, F("fallback-SONY"), SONY, 0, 0);
+        return true;
+      }
+      break;
 
-  case 16:
-    if (doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, 16, false); })) {
-      recordSendDiagnostics(true, F("fallback-JVC"), JVC, 0, 0);
-      return true;
-    }
-    break;
+    case 16:
+      if (doRepeats([&]{ IrSender.sendJVC((unsigned long)e.value, 16, false); })) {
+        recordSendDiagnostics(true, F("fallback-JVC"), JVC, 0, 0);
+        return true;
+      }
+      break;
 
-  case 20:
-    if (doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, 20); })) {
-      recordSendDiagnostics(true, F("fallback-RC5"), RC5, 0, 0);
-      return true;
-    }
-    break;
-}
-recordSendDiagnostics(false, F("fallback-failed"), t, 0, rawFreq);
-return false;
+    case 20:
+      if (doRepeats([&]{ IrSender.sendRC5((unsigned long)e.value, 20); })) {
+        recordSendDiagnostics(true, F("fallback-RC5"), RC5, 0, 0);
+        return true;
+      }
+      break;
+  }
+  recordSendDiagnostics(false, F("fallback-failed"), t, 0, rawFreq);
+  return false;
 }
 
 // === Odeslání „podle indexu“ – načte případný RAW a zavolá Core ===
