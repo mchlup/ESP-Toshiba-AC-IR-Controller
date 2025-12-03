@@ -45,6 +45,11 @@ static Fan fanFromString(const char *fanStr) {
 static Swing swingFromString(const char *swingStr) {
     if (!swingStr) return SWING_OFF;
 
+    // Nově: "auto" chápeme jako kontinuální swing.
+    if (strcasecmp(swingStr, "auto") == 0) {
+        return SWING_ON;
+    }
+
     // Basic mapping: any "*swing*" means we ask for continuous swing.
     if (strstr(swingStr, "swing") != nullptr) {
         return SWING_ON;
