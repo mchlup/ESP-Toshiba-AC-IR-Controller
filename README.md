@@ -1,79 +1,225 @@
-# ESP IR Controller
+📡 ESP-Toshiba-IR-Controller
 
-Firmware pro ESP8266/ESP32, které umožňuje učit se IR kódy z libovolných ovladačů a z webového rozhraní je následně odesílat. Kód je neblokující a používá webové API pro správu uložených kódů.
+Inteligentní IR bridge pro klimatizace Toshiba (WH-L11SE protokol)
+ESP8266 / ESP8285 – IR odesílání, WebUI, MQTT, Modbus TCP
 
-## Funkce
+✨ Funkce
 
-- Učení IR kódu na vyžádání přes webové rozhraní.
-- Ukládání naučených kódů do paměti zařízení (LittleFS).
-- Odesílání kódů dle názvu zařízení / funkce.
-- Přehled uložených kódů a jejich mazání přes webové UI.
-- REST API pro integraci s dalšími systémy.
-- Správa připojení k Wi-Fi přes portál [WiFiManager](https://github.com/tzapu/WiFiManager) včetně vlastních parametrů zařízení.
+Ovládání klimatizace Toshiba přes IR
+Bez originálního ovladače (kompatibilní s WH-L11SE IR protokolem).
+Odesílání plně vygenerovaných IR rámců (zap/vyp, teplota, režim, ventilátor, swing…).
 
-## Hardwarové požadavky
+WebUI
+Moderní a responzivní uživatelské rozhraní:
 
-- Vývojová deska ESP8266 (např. NodeMCU) nebo ESP32.
-- IR přijímač připojený na pin definovaný v `IR_RECV_PIN` (výchozí GPIO14 / D5).
-- IR LED s tranzistorovým budičem připojená na pin `IR_SEND_PIN` (výchozí GPIO4 / D2).
-- Napájení 3.3 V a společná zem.
+Režimy s ikonami (Auto / Chlazení / Topení / Dry / Ventilátor)
 
-## Příprava projektu pro Arduino IDE
+Slider teploty s live náhledem
 
-1. Naklonujte repozitář a otevřete soubor `ESPToshibaACIRController.ino` v Arduino IDE. (IDE vás může požádat o přejmenování složky na `ESPToshibaACIRController`.)
-2. V menu **Nástroje → Deska** zvolte odpovídající desku ESP8266 nebo ESP32 a nakonfigurujte správný port.
-3. Do adresáře `sketchbook/libraries` nainstalujte (např. přes Správce knihoven) následující knihovny:
-   - [ArduinoJson](https://arduinojson.org/) verze 6 nebo novější,
-   - [IRremoteESP8266](https://github.com/crankyoldgit/IRremoteESP8266) (automaticky poskytuje `IRrecv`/`IRsend`),
-   - [WiFiManager](https://github.com/tzapu/WiFiManager),
-   - `LittleFS` (ESP8266 používá vestavěnou implementaci, pro ESP32 nainstalujte knihovnu [LittleFS_esp32](https://github.com/lorol/LITTLEFS)).
-4. Nahrajte firmware standardním tlačítkem **Nahrát**.
+Výkon: ECO / NORMAL / HI-POWER
 
-Po nahrání se zařízení přepne do režimu konfigurace Wi-Fi (přístupový bod `ESP-IR-Bridge`, bez hesla). Připojte se k němu, otevřete `http://192.168.4.1/` a v portálu WiFiManageru zadejte přístupové údaje k vaší síti. Na stejné stránce najdete také vlastní parametry:
+Ventilátor (Auto / Quiet / Low / Medium / High / Max)
 
-- **Název zařízení** – text použitý v uživatelském rozhraní a odpovědích API.
-- **Doba učení (ms)** – maximální délka čekání na zachycení IR kódu.
+Swing (Fix / V-swing / H-swing / Auto)
 
-Po uložení se zařízení restartuje a připojí k vybrané síti. Konfigurace se ukládá do souboru `/config.json` v LittleFS (kódy zůstávají v `/codes.json`). Pokud chcete vymazat konfiguraci, smažte tyto soubory nebo spusťte `LITTLEFS.format()`.
+MQTT + Modbus TCP konfigurace
 
-## Webové rozhraní
+Volitelný identifikátor zařízení (pro víc jednotek v LAN)
 
-Po připojení k Wi-Fi otevře zařízení webový server na portu 80. Hlavní stránka umožňuje:
+MQTT
 
-- zahájit učení kódu (zadejte název a stiskněte "Spustit učení"),
-- zobrazit seznam uložených kódů,
-- poslat nebo smazat vybraný kód.
+Publikace stavu (/state)
 
-Status sekce průběžně informuje o stavu připojení, posledním naučeném kódu a využívá nastavený název zařízení.
+Příjem příkazů (/set/...)
 
-## REST API
+Podpora MQTT AUTH (user/pass)
 
-| Metoda | Cesta | Popis |
-| ------ | ----- | ----- |
-| GET | `/api/codes` | Vrátí seznam uložených kódů. |
-| POST | `/api/learn` | Zahájí učení. JSON tělo `{ "name": "TV On" }`. |
-| POST | `/api/send` | Odešle kód dle názvu. JSON tělo `{ "name": "TV On" }`. |
-| DELETE | `/api/codes?name=TV%20On` | Smaže uložený kód. |
-| GET | `/api/status` | Informace o stavu učení a posledním zachyceném kódu. |
+Automatické obnovení spojení
 
-## Poznámky
+Modbus TCP
 
-- Pokud potřebujete změnit Wi-Fi síť nebo parametry zařízení, odpojte se od známé Wi-Fi (např. vypnutím routeru). Po několika neúspěšných pokusech o připojení WiFiManager automaticky znovu otevře konfigurační portál.
-- Učení se automaticky ukončí po uplynutí nastaveného limitu (výchozí 60 s), pokud není zachycen žádný kód.
-- Kódy známých protokolů jsou ukládány společně se surovými daty, takže je možné je reprodukovat i pro neznámé protokoly.
+Standardní Modbus TCP server na portu 502
 
-## Toshiba IR control (ESP32-C3 + IRremote 3.3.2)
+Holding registry pro zápis (power, mode, fan, swing, setpoint)
 
-Tento firmware obsahuje nativní vysílání IR kódů pro klimatizace Toshiba (kompaktní 72bit rámec). Pro správnou funkci:
+Lze připojit na Loxone, Home Assistant, OpenHAB…
 
-1. **Zapojení IR LED** – zvolený GPIO (např. GPIO4) propojte přes rezistor 100–220 Ω na anodu IR LED, katodu veďte na GND.
-2. **Nastavení TX pinu** – v hlavním WebUI na kartě nastavení zadejte číslo pinu a uložte. Změna okamžitě inicializuje jedinou instanci `IrSender`.
-3. **Odeslání příkazu** – buď použijte panel „Toshiba IR“ ve WebUI, nebo REST API:
+Toshiba IR generátor (WH-L11SE)
+Vlastní implementace enkódování 72bit / 9-byte rámců
+(včetně správného OFF rámce, který knihovna IRremoteESP8266 neumí).
 
-```
-GET /api/toshiba_send?power=1&mode=heat&temp=23&fan=3
-GET /api/toshiba_send?power=1&mode=cool&temp=25&fan=auto
-GET /api/toshiba_send?power=0
-```
+Hybridní režim IR
 
-Parametry `power`, `mode`, `temp` (17–30 °C) a `fan` (`auto` nebo 1–5) jsou volitelné; nevyplněné hodnoty doplní výchozí stav (zapnuto, auto, 24 °C, auto ventilátor).
+Zapnutí / změna parametrů: knihovna IRToshibaAC
+
+Vypnutí (OFF): vlastní ToshibaIrGenerator → 100% kompatibilita
+
+📦 Hardwarové požadavky
+
+ESP8266 / ESP8285
+
+IR LED + tranzistor (např. 2N2222, 2N2222A)
+– doporučeno kvůli výkonu pro 8–10 m dosah
+
+Rezistor + napájení 3.3 V
+
+Volitelně: krabička, externí IR LED
+
+🧱 Struktura projektu
+Soubor	Popis
+ESP-Toshiba-IR-Controller.ino	Hlavní aplikace, WebUI, konfigurace, routy, Modbus TCP, MQTT
+IRControl.cpp / .h	Vysílání IR rámců (hybridní režim)
+ToshibaIrGenerator.cpp / .h	100% implementace Toshiba WH-L11SE rámců
+AcState.cpp / .h	Virtuální stav klimatizace
+MqttHandler.cpp / .h	MQTT klient (auth, reconnect, publish)
+ModbusHandler.cpp / .h	Modbus TCP server a registry
+🌐 Webové rozhraní
+Hlavní vlastnosti
+
+Responzivní UI (desktop, tablet, mobil)
+
+Moderní design (dark theme)
+
+Ikony režimů:
+
+⚙ Auto
+
+❄ Chlazení
+
+🔥 Topení
+
+💧 Dry
+
+🌀 Ventilátor
+
+Nastavení teploty přes slider (17–30 °C)
+
+Tří-stavový výkon:
+
+ECO (50%)
+
+NORMAL (75%)
+
+HI-POWER (100%)
+
+Konfigurace
+
+⬥ MQTT host / port / topic / user / pass
+
+⬥ Povolit / zakázat MQTT
+
+⬥ Modbus TCP (Unit ID, enable/disable)
+
+⬥ Device ID – pro LAN s více IR bridge jednotkami
+
+📡 MQTT
+Topics (default)
+toshiba/ac/state
+toshiba/ac/set/power
+toshiba/ac/set/mode
+toshiba/ac/set/temp
+toshiba/ac/set/fan
+toshiba/ac/set/swing
+toshiba/ac/set/pselect
+toshiba/ac/heartbeat
+
+Příklady příkazů
+
+Zapnutí:
+
+{"power":"on"}
+
+
+Nastavení teploty:
+
+{"temp":23}
+
+
+Výkon HI-POWER:
+
+{"pselect":"100%"}
+
+🧰 Modbus TCP registry
+
+Plně kompatibilní se šablonou pro Loxone.
+
+Holding registry (zápis)
+Adresa	Název	Hodnoty
+HR0	Power	0=off, 1=on
+HR1	Setpoint	17–30
+HR2	Mode	0 auto, 1 cool, 2 heat, 3 dry, 4 fan, 5 off
+HR3	Fan	0 auto,1 quiet,2 low,3 medium,4 high,5 max
+HR4	Swing	0 fix,1 v,2 h,3 hv,4 auto
+
+Každý zápis okamžitě odesílá IR rámec.
+
+Čtení (read-only)
+
+HR0–HR4: aktuální stav (virtuální)
+
+HR7: „operating state“
+
+HR8: flags
+
+HR9: error
+
+HR10: status bits
+
+HR11: uptime
+
+🔧 IR protokol Toshiba WH-L11SE
+
+Projekt obsahuje kompletní implementaci:
+
+9-byte frame
+
+XOR checksum
+
+mode bits, temp nibble, fan bits, swing codes
+
+OFF mód (mode=7) → nutný pro vypnutí jednotky
+
+Rámce lze generovat čistě softwarově, bez potřeby knihovny.
+
+🚀 Instalace
+1. Překlad & upload
+
+PlatformIO nebo Arduino IDE
+
+Board: ESP8266 (Wemos, Witty, ESP-12F, ESP-01S…)
+
+Připoj IR LED + tranzistor
+
+Nahraj FW
+
+2. První spuštění
+
+ESP vytvoří AP nebo se připojí k uložené WiFi
+
+Otevři WebUI ve webovém prohlížeči
+
+Nastav:
+
+WiFi
+
+MQTT / Modbus
+
+Device ID
+
+Režim ovládání AC
+
+📦 Integrace s Loxone
+
+K dispozici je hotová LoxConfig Modbus šablona:
+
+Power (write)
+
+Setpoint (write)
+
+Mode / Fan / Swing (write)
+
+Všechny stavy (read)
+
+Automatické odeslání IR po zápisu registru
+
+Loxone pak může ovládat klimatizaci jako standardní Modbus zařízení.
