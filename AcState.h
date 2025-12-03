@@ -23,6 +23,11 @@ extern AcState gAcState;
 // Inicializace výchozích hodnot.
 void AcState_initDefaults();
 
+// Normalizace/validace gAcState – ořezání rozsahu teploty,
+// doplnění výchozích hodnot, kontrola povolených stringů.
+// Můžeš ji volat po změnách z WebUI / MQTT / Modbusu.
+void AcState_normalize();
+
 // Zapsání gAcState do hvacSettings (pro funkce, co chtějí hvacSettings).
 void AcState_toHvacSettings(hvacSettings &s);
 

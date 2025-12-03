@@ -12,6 +12,8 @@ static const uint16_t HR_FAN   = 3;   // 0=AUTO,1=QUIET,2..6
 static const uint16_t HR_SWING = 4;   // 0=FIX,1=V,2=H,3=HV
 static const uint16_t HR_PURE  = 5;   // 0=OFF,1=ON
 static const uint16_t HR_PSEL  = 6;   // 0=50%,1=75%,2=100%
+// Stavový registr – jednoduchá zpětná vazba pro Loxone / SCADA
+static const uint16_t HR_STATUS = 7;  // viz enum ModbusStatus
 
 // poslední známé hodnoty
 static uint16_t lastPower = 0;
@@ -21,6 +23,15 @@ static uint16_t lastFan   = 0;
 static uint16_t lastSwing = 0;
 static uint16_t lastPure  = 0;
 static uint16_t lastPsel  = 2;
+static uint16_t lastStatus= MODBUS_STATUS_OK;
+
+// Debounce pro hromadné zápisy – IR se odešle až po malé prodlevě
+// od poslední změny registru.
+static bool      pendingChange   = false;
+static unsigned long lastChangeMs= 0;
+// ~100–150 ms je obvykle víc než dost, aby Loxone / SCADA stihla
+// odeslat všechny požadované zápisy.
+static const uint16_t MODBUS_DEBOUNCE_MS = 120;
 
 void ModbusHandler_init(const ModbusConfig &cfg, AcStateChangedCallback cb) {
   modbusCfg = cfg;
@@ -68,6 +79,10 @@ void ModbusHandler_begin() {
   else if (gAcState.powerSelect == "75%")  lastPsel = 1;
   else lastPsel = 2;
   mb.addHreg(HR_PSEL, lastPsel);
+
+  // status na začátku = OK
+  lastStatus = MODBUS_STATUS_OK;
+  mb.addHreg(HR_STATUS, lastStatus);
 }
 
 const ModbusConfig &ModbusHandler_getConfig() {
@@ -76,6 +91,16 @@ const ModbusConfig &ModbusHandler_getConfig() {
 
 void ModbusHandler_setConfig(const ModbusConfig &cfg) {
   modbusCfg = cfg;
+}
+
+void ModbusHandler_setStatus(uint16_t status) {
+  lastStatus = status;
+  if (!modbusCfg.enabled) return;
+  mb.Hreg(HR_STATUS, lastStatus);
+}
+
+uint16_t ModbusHandler_getStatus() {
+  return lastStatus;
 }
 
 void ModbusHandler_loop() {
@@ -108,10 +133,13 @@ void ModbusHandler_loop() {
 
   v = mb.Hreg(HR_TEMP);
   if (v != lastTemp) {
-    lastTemp = v;
     if (v < 17) v = 17;
     if (v > 30) v = 30;
-    gAcState.temp = (uint8_t)v;
+    lastTemp = v;
+    gAcState.temp = (uint8_t)lastTemp;
+    // zapiš zpět do Modbus registru oříznutou hodnotu,
+    // aby Loxone/SCADA viděla skutečnou efektivní teplotu
+    mb.Hreg(HR_TEMP, lastTemp);
     changed = true;
   }
 
@@ -160,8 +188,21 @@ void ModbusHandler_loop() {
     changed = true;
   }
 
-  if (changed && stateChangedCb) {
-    stateChangedCb();   // → main: IR + MQTT state publish
+  // Pokud došlo k jedné nebo více změnám registrů, pouze si to
+  // zapamatujeme a počkáme malou dobu, než skutečně odpálíme callback.
+  if (changed) {
+    pendingChange = true;
+    lastChangeMs = millis();
+  }
+
+  if (pendingChange && stateChangedCb) {
+    unsigned long now = millis();
+    if ((uint32_t)(now - lastChangeMs) >= MODBUS_DEBOUNCE_MS) {
+      pendingChange = false;
+      stateChangedCb();               // → main: IR + MQTT state publish
+      // po úspěšném callbacku nastavíme základní status OK
+      ModbusHandler_setStatus(MODBUS_STATUS_OK);
+    }
   }
 }
 

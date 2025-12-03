@@ -10,6 +10,10 @@
 #include <IRremoteESP8266.h>
 #include <ir_Toshiba.h>   // IRToshibaAC
 #include "AcState.h"
+
+// Společný callback po změně stavu AC (WebUI / MQTT / Modbus).
+void onAcStateChanged();
+
 #include "IRControl.h"
 #include "MqttHandler.h"
 #include "ModbusHandler.h"
@@ -526,7 +530,13 @@ void setup() {
   MqttHandler_setConfig(gMqttCfg);
 
   // Modbus TCP
-  ModbusHandler_init(gModbusCfg, onExternalAcStateChanged);
+  ModbusConfig mbCfg;
+  // TODO: pokud máš konfiguraci jinde (EEPROM / webUI),
+  // nastav tady podle ní:
+  mbCfg.unitId  = 1;      // nebo tvoje stávající adresa zařízení
+  mbCfg.enabled = true;   // nebo podle configu
+
+  ModbusHandler_init(mbCfg, onAcStateChanged);
   ModbusHandler_begin();
 
   Serial.print(F("Wi-Fi připojeno, IP: "));
@@ -542,6 +552,21 @@ void setup() {
 
   server.begin();
   Serial.println(F("HTTP server běží na portu 80."));
+}
+
+// --- AC state change handler ---------------------------------------------
+void onAcStateChanged() {
+  // sjednocení / kontrola stavu
+  AcState_normalize();
+
+  // okamžité odeslání IR do klimatizace
+  IRControl_sendFromState();
+
+  // synchronizace zpětné vazby pro Modbus (Loxone)
+  ModbusHandler_updateRegsFromState();
+
+  // případně sem můžeš přidat i publish do MQTT:
+  // MqttHandler_publishState();
 }
 
 // ---------------------------------------------------------------------------
