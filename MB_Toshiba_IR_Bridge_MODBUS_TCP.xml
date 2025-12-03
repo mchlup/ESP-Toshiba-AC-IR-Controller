@@ -1,0 +1,62 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Modbus Title="Toshiba IR Bridge (ESP-Toshiba-IR-Controller) MODBUS-TCP" Comment="Ovládání klimatizace přes IR z Loxone (Modbus TCP)" HintText="" Channel="1">
+  <Info templateType="7" minVersion="16000610"/>
+
+  <!-- ====== ČTENÍ STAVU (virtuální stav v ESP, ne skutečný feedback z AC) ====== -->
+
+  <!-- HR0: Power stav (0=off, 1=on) -->
+  <ModbusCmd Title="Power (state)" Comment="0=off, 1=on – virtuální stav v IR bridge" HintText="" ModbusCmd="3" ModbusPollingCycle="2" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR1: Nastavený setpoint -->
+  <ModbusCmd Title="Setpoint" Comment="Požadovaná teplota" HintText="" ModbusAddress="1" ModbusCmd="3" ModbusPollingCycle="2" Unit="&lt;v.0&gt; °C" Analog="true" Sensor="true" SourceValHigh="100" DestValHigh="100"/>
+
+  <!-- HR2: Režim (viz Mode (set)) -->
+  <ModbusCmd Title="Mode (state)" Comment="0=auto,1=cool,2=heat,3=dry,4=fan_only,5=off" HintText="" ModbusAddress="2" ModbusCmd="3" ModbusDataType="1" ModbusPollingCycle="2" Unit="&lt;v&gt;" Analog="true" Sensor="true" SourceValHigh="100" DestValHigh="100"/>
+
+  <!-- HR3: Ventilátor (viz Fan (set)) -->
+  <ModbusCmd Title="Fan (state)" Comment="0=auto,1=quiet,2=low,3=medium,4=high,5=max" HintText="" ModbusAddress="3" ModbusCmd="3" ModbusPollingCycle="2" Unit="&lt;v&gt;" Analog="true" Sensor="true" SourceValHigh="10" DestValHigh="10"/>
+
+  <!-- HR4: Swing (viz Swing (set)) -->
+  <ModbusCmd Title="Swing (state)" Comment="0=fix,1=v_swing,2=h_swing,3=hv_swing,4=auto" HintText="" ModbusAddress="4" ModbusCmd="3" ModbusPollingCycle="2" Unit="&lt;v&gt;" Analog="true" Sensor="true" SourceValHigh="100" DestValHigh="100"/>
+
+  <!-- HR5: Rezerva / případné interní info (volitelně lze zobrazit) -->
+  <ModbusCmd Title="Reserved 5" Comment="Rezervováno – podle FW" HintText="" ModbusAddress="5" ModbusCmd="3" ModbusPollingCycle="10" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR6: Rezerva / případné interní info (volitelně lze zobrazit) -->
+  <ModbusCmd Title="Reserved 6" Comment="Rezervováno – podle FW" HintText="" ModbusAddress="6" ModbusCmd="3" ModbusPollingCycle="10" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR7: Virtuální „Operating state“ – může kopírovat Mode/Power -->
+  <ModbusCmd Title="Operating state" Comment="0=auto,1=cool,2=heat,3=dry,4=fan_only,5=off – vypočtený stav" HintText="" ModbusAddress="7" ModbusCmd="3" ModbusPollingCycle="5" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR8: Flags – bitmask podle FW -->
+  <ModbusCmd Title="Flags" Comment="bitmask (interní stav bridge)" HintText="" ModbusAddress="8" ModbusCmd="3" ModbusPollingCycle="10" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR9: Error code -->
+  <ModbusCmd Title="Error code" Comment="0xFFFF=unknown" HintText="" ModbusAddress="9" ModbusCmd="3" ModbusPollingCycle="10" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR10: Status bits -->
+  <ModbusCmd Title="Status bits" Comment="bit0=IR modul OK, bit1=MQTT, bit2=WiFi, bit3=Modbus..." HintText="" ModbusAddress="10" ModbusCmd="3" ModbusPollingCycle="5" Unit="" Analog="false" Sensor="true"/>
+
+  <!-- HR11: Uptime (sekundy, low16) -->
+  <ModbusCmd Title="Uptime (s, low16)" Comment="" HintText="" ModbusAddress="11" ModbusCmd="3" ModbusPollingCycle="10" Unit="&lt;v.0&gt; s" Analog="true" Sensor="true" SourceValHigh="100" DestValHigh="100"/>
+
+  <!-- ====== ZÁPIS – OVLÁDÁNÍ IR PŘÍKAZŮ ====== -->
+
+  <!-- HR0: Power -->
+  <ModbusCmd Title="Power (write 0/1)" Comment="0=off, 1=on – při změně odešle IR příkaz" HintText="" ModbusCmd="6" Unit="" Analog="false" Sensor="false" RepeatRate="3600"/>
+
+  <!-- HR1: Setpoint -->
+  <ModbusCmd Title="Setpoint (write 17..30 °C)" Comment="Rozsah 17..30 °C, při změně odešle IR" HintText="" ModbusAddress="1" ModbusCmd="6" Unit="&lt;v.0&gt; °C" Analog="true" Sensor="false" SourceValHigh="100" DestValHigh="100" RepeatRate="3600"/>
+
+  <!-- HR2: Mode –
+       0=auto,1=cool,2=heat,3=dry,4=fan_only,5=off -->
+  <ModbusCmd Title="Mode (set)" Comment="0=auto,1=cool,2=heat,3=dry,4=fan_only,5=off" HintText="" ModbusAddress="2" ModbusCmd="6" ModbusDataType="1" Unit="&lt;v&gt;" Analog="true" Sensor="false" SourceValHigh="10" DestValHigh="10" RepeatRate="5"/>
+
+  <!-- HR3: Fan –
+       0=auto,1=quiet,2=low,3=medium,4=high,5=max -->
+  <ModbusCmd Title="Fan (set)" Comment="0=auto,1=quiet,2=low,3=medium,4=high,5=max" HintText="" ModbusAddress="3" ModbusCmd="6" ModbusDataType="1" Unit="&lt;v&gt;" Analog="true" Sensor="false" SourceValHigh="10" DestValHigh="10" RepeatRate="5"/>
+
+  <!-- HR4: Swing –
+       0=fix,1=v_swing,2=h_swing,3=hv_swing,4=auto -->
+  <ModbusCmd Title="Swing (set)" Comment="0=fix,1=v_swing,2=h_swing,3=hv_swing,4=auto" HintText="" ModbusAddress="4" ModbusCmd="6" ModbusDataType="1" Unit="&lt;v.1&gt;" Analog="true" Sensor="false" SourceValHigh="10" DestValHigh="10" RepeatRate="10"/>
+</Modbus>
