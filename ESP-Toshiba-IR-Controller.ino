@@ -40,6 +40,9 @@ MqttConfig gMqttCfg = {
   false             // enabled (zapni až po otestování)
 };
 
+// ===== Identifikátor IR zařízení =====
+String gDeviceId = "IR-1";
+
 // ===== Modbus TCP config =====
 ModbusConfig gModbusCfg = {
   1,     // unitId (adresa zařízení)
@@ -111,6 +114,8 @@ void handleRoot() {
   html += WiFi.SSID();
   html += F(" &middot; IP: ");
   html += WiFi.localIP().toString();
+  html += F(" &middot; ID: ");
+  html += gDeviceId;
   html += F("</div>"
             "<form action='/set' method='GET'>");
 
@@ -255,6 +260,13 @@ void handleRoot() {
 
   html += F("</fieldset>");
 
+  // Identifikace zařízení
+  html += F("<fieldset><legend>Identifikace zařízení</legend>");
+  html += F("<label>ID zařízení:</label>");
+  html += F("<input type='text' name='device_id' maxlength='32' value='");
+  html += gDeviceId;
+  html += F("'></fieldset>");
+
   // MQTT konfigurace
   html += F("<fieldset><legend>MQTT</legend>");
   html += F("<label><input type='checkbox' name='mqtt_enabled' value='1'");
@@ -357,6 +369,11 @@ void handleSet() {
 
   if (server.hasArg("pselect")) {
     gAcState.powerSelect = server.arg("pselect");
+  }
+
+  // ----- ID zařízení z WebUI -----
+  if (server.hasArg("device_id")) {
+    gDeviceId = server.arg("device_id");
   }
 
   // ----- MQTT konfigurace z WebUI -----

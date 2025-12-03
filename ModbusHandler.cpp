@@ -30,7 +30,7 @@ void ModbusHandler_init(const ModbusConfig &cfg, AcStateChangedCallback cb) {
 void ModbusHandler_begin() {
   if (!modbusCfg.enabled) return;
 
-  mb.server(modbusCfg.unitId);  // port 502 default
+  mb.server();  // = mb.server(MODBUSIP_PORT);
 
   // inicializace Hreg podle stavu
   lastPower = (gAcState.power == "on") ? 1 : 0;
