@@ -18,7 +18,7 @@ static const uint16_t HR_STATUS = 7;  // viz enum ModbusStatus
 // poslední známé hodnoty
 static uint16_t lastPower = 0;
 static uint16_t lastMode  = 0;
-static uint16_t lastTemp  = 24;
+static uint16_t lastTemp  = 22;
 static uint16_t lastFan   = 0;
 static uint16_t lastSwing = 0;
 static uint16_t lastPure  = 0;

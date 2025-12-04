@@ -4,7 +4,7 @@ AcState gAcState;
 
 void AcState_initDefaults() {
   gAcState.power       = "off";
-  gAcState.temp        = 24;
+  gAcState.temp        = 22;
   gAcState.mode        = "auto";
   gAcState.fan         = "auto";
   gAcState.swing       = "fix";

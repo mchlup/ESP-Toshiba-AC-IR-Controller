@@ -1,153 +1,142 @@
 #include "MqttHandler.h"
+#include "Logging.h"
+#include <PubSubClient.h>
+#include <ctype.h>
 
-static PubSubClient mqttClient;
-static MqttConfig mqttCfg;
-static AcStateChangedCallback stateChangedCb = nullptr;
+static PubSubClient           mqtt;
+static MqttConfig             gCfg;
+static AcStateChangedCallback gStateChangedCb = nullptr;
+static bool                   gInitialised    = false;
 
-static String topicBaseSet;
-static String topicBaseState;
-
-// forward
-static void mqttCallback(char *topic, byte *payload, unsigned int length);
-static void ensureMqttConnected();
-
-void MqttHandler_init(Client &netClient, AcStateChangedCallback cb) {
-  mqttClient.setClient(netClient);
-  mqttClient.setCallback(mqttCallback);
-  stateChangedCb = cb;
-
-  mqttCfg.enabled   = false;
-  mqttCfg.host      = "";
-  mqttCfg.port      = 1883;
-  mqttCfg.clientId  = "esp-toshiba-ir";
-  mqttCfg.baseTopic = "toshiba/ac";
-  mqttCfg.user      = "";
-  mqttCfg.pass      = "";
-
-  topicBaseSet   = mqttCfg.baseTopic + "/set/";
-  topicBaseState = mqttCfg.baseTopic + "/state/";
+static String topicState() {
+  return gCfg.baseTopic + "/" + gCfg.clientId + "/state";
+}
+static String topicCommand() {
+  return gCfg.baseTopic + "/" + gCfg.clientId + "/set";
 }
 
-void MqttHandler_setConfig(const MqttConfig &cfg) {
-  mqttCfg = cfg;
+static bool ensureConnected() {
+  if (!gCfg.enabled || !gInitialised) return false;
+  if (mqtt.connected()) return true;
 
-  topicBaseSet   = mqttCfg.baseTopic + "/set/";
-  topicBaseState = mqttCfg.baseTopic + "/state/";
+  Logging::logf(Logging::LEVEL_INFO, "MQTT", "Connecting to %s:%u ...",
+                gCfg.host.c_str(), gCfg.port);
 
-  if (mqttCfg.enabled && mqttCfg.host.length()) {
-    mqttClient.setServer(mqttCfg.host.c_str(), mqttCfg.port);
+  bool ok;
+  if (gCfg.user.length() > 0) {
+    ok = mqtt.connect(gCfg.clientId.c_str(),
+                      gCfg.user.c_str(), gCfg.pass.c_str());
+  } else {
+    ok = mqtt.connect(gCfg.clientId.c_str());
+  }
+  if (!ok) {
+    Logging::logf(Logging::LEVEL_WARN, "MQTT", "Connect failed, rc=%d", mqtt.state());
+    return false;
+  }
+
+  String cmd = topicCommand();
+  mqtt.subscribe(cmd.c_str());
+  Logging::logf(Logging::LEVEL_INFO, "MQTT", "Connected, subscribed to %s", cmd.c_str());
+
+  return true;
+}
+
+static void handleMessage(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) {
+    msg += static_cast<char>(payload[i]);
+  }
+  Logging::logf(Logging::LEVEL_INFO, "MQTT", "RX topic=%s payload=%s", topic, msg.c_str());
+
+  bool changed = false;
+  String lower = msg;
+  lower.trim();
+  lower.toLowerCase();
+
+  // Jednoduché příkazy: "on"/"off"
+  if (lower == "on" || lower == "off") {
+    gAcState.power = lower;
+    changed = true;
+  } else {
+    // Hledání podřetězců v JSON-like payloadu
+    if (lower.indexOf("power\":\"on\"")  >= 0) { gAcState.power = "on";  changed = true; }
+    if (lower.indexOf("power\":\"off\"") >= 0) { gAcState.power = "off"; changed = true; }
+
+    if (lower.indexOf("mode\":\"cool\"")     >= 0) { gAcState.mode = "cool";     changed = true; }
+    if (lower.indexOf("mode\":\"heat\"")     >= 0) { gAcState.mode = "heat";     changed = true; }
+    if (lower.indexOf("mode\":\"dry\"")      >= 0) { gAcState.mode = "dry";      changed = true; }
+    if (lower.indexOf("mode\":\"fan_only\"") >= 0) { gAcState.mode = "fan_only"; changed = true; }
+
+    int ti = lower.indexOf("\"temp\":");
+    if (ti >= 0) {
+      ti += 7;
+      int end = ti;
+      while (end < (int)lower.length() && isDigit(lower[end])) end++;
+      if (end > ti) {
+        uint8_t tval = (uint8_t) lower.substring(ti, end).toInt();
+        gAcState.temp = tval;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    AcState_normalize();
+    if (gStateChangedCb) gStateChangedCb();
   }
 }
 
-const MqttConfig &MqttHandler_getConfig() {
-  return mqttCfg;
+void MqttHandler_init(Client &netClient, const MqttConfig &cfg, AcStateChangedCallback cb) {
+  gCfg = cfg;
+  gStateChangedCb = cb;
+  mqtt.setClient(netClient);
+  mqtt.setServer(cfg.host.c_str(), cfg.port);
+  mqtt.setCallback(handleMessage);
+  gInitialised = true;
 }
 
 void MqttHandler_loop() {
-  if (!mqttCfg.enabled || !mqttCfg.host.length()) return;
+  if (!gCfg.enabled || !gInitialised) return;
 
-  ensureMqttConnected();
-  mqttClient.loop();
-}
-
-static void ensureMqttConnected() {
-  if (mqttClient.connected()) return;
-
-  Serial.print(F("[MQTT] Connecting to "));
-  Serial.print(mqttCfg.host);
-  Serial.print(F(":"));
-  Serial.print(mqttCfg.port);
-  Serial.print(F(" ... "));
-
-  String cid = mqttCfg.clientId;
-  if (!cid.length()) cid = "esp-toshiba-ir";
-
-  bool ok;
-  if (mqttCfg.user.length()) {
-    ok = mqttClient.connect(cid.c_str(),
-                            mqttCfg.user.c_str(),
-                            mqttCfg.pass.c_str());
-  } else {
-    ok = mqttClient.connect(cid.c_str());
-  }
-
-  if (ok) {
-    Serial.println(F("OK"));
-
-    String sub = topicBaseSet + "+";
-    mqttClient.subscribe(sub.c_str());
-
-    // po reconnectu můžeme znovu publikovat stav
-    MqttHandler_publishState();
-  } else {
-    Serial.print(F("FAIL rc="));
-    Serial.println(mqttClient.state());
-  }
-}
-
-static void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  String t(topic);
-  String msg;
-  msg.reserve(length + 1);
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-
-  Serial.print(F("[MQTT] "));
-  Serial.print(t);
-  Serial.print(F(" = "));
-  Serial.println(msg);
-
-  if (!t.startsWith(topicBaseSet)) return;
-
-  String key = t.substring(topicBaseSet.length());
-  bool changed = false;
-
-  if (key == "power") {
-    if (msg == "on" || msg == "off") {
-      gAcState.power = msg;
-      changed = true;
+  if (!mqtt.connected()) {
+    static unsigned long lastAttempt = 0;
+    unsigned long now = millis();
+    if (now - lastAttempt > 5000) {
+      lastAttempt = now;
+      ensureConnected();
     }
-  } else if (key == "mode") {
-    gAcState.mode = msg;
-    changed = true;
-  } else if (key == "temp") {
-    int v = msg.toInt();
-    if (v < 17) v = 17;
-    if (v > 30) v = 30;
-    gAcState.temp = (uint8_t)v;
-    changed = true;
-  } else if (key == "fan") {
-    gAcState.fan = msg;
-    changed = true;
-  } else if (key == "swing") {
-    gAcState.swing = msg;
-    changed = true;
-  } else if (key == "pure") {
-    gAcState.pure = msg;
-    changed = true;
-  } else if (key == "pselect") {
-    gAcState.powerSelect = msg;
-    changed = true;
-  }
-
-  if (changed && stateChangedCb) {
-    stateChangedCb();   // → main: IRControl_sendFromState + publishState + update Modbus
+  } else {
+    mqtt.loop();
   }
 }
 
 void MqttHandler_publishState() {
-  if (!mqttCfg.enabled || !mqttCfg.host.length()) return;
-  if (!mqttClient.connected()) return;
+  if (!ensureConnected()) return;
 
-  auto pub = [&](const String &sub, const String &val) {
-    String topic = topicBaseState + sub;
-    mqttClient.publish(topic.c_str(), val.c_str(), true); // retained
-  };
+  String t = topicState();
+  String payload;
+  payload.reserve(160);
+  payload += F("{\"power\":\"");        payload += gAcState.power;       payload += F("\",");
+  payload += F("\"temp\":");            payload += gAcState.temp;        payload += F(",");
+  payload += F("\"mode\":\"");          payload += gAcState.mode;        payload += F("\",");
+  payload += F("\"fan\":\"");           payload += gAcState.fan;         payload += F("\",");
+  payload += F("\"swing\":\"");         payload += gAcState.swing;       payload += F("\",");
+  payload += F("\"pure\":\"");          payload += gAcState.pure;        payload += F("\",");
+  payload += F("\"powerSelect\":\"");   payload += gAcState.powerSelect; payload += F("\"}");
+  mqtt.publish(t.c_str(), payload.c_str(), true);
+  Logging::logf(Logging::LEVEL_DEBUG, "MQTT", "Published state to %s: %s", t.c_str(), payload.c_str());
+}
 
-  pub("power", gAcState.power);
-  pub("mode", gAcState.mode);
-  pub("temp", String(gAcState.temp));
-  pub("fan", gAcState.fan);
-  pub("swing", gAcState.swing);
-  pub("pure", gAcState.pure);
-  pub("pselect", gAcState.powerSelect);
+MqttConfig MqttHandler_getConfig() {
+  return gCfg;
+}
+
+void MqttHandler_setConfig(const MqttConfig &cfg) {
+  gCfg = cfg;
+  mqtt.setServer(cfg.host.c_str(), cfg.port);
+  // při změně configu odpojíme, další loop() se připojí s novým nastavením
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+  }
 }

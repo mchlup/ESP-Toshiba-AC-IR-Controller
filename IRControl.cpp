@@ -7,6 +7,11 @@ static IRToshibaAC irToshiba(0);   // pin nastavíme v IRControl_begin
 void IRControl_begin(uint16_t irPin) {
   // Přenastavíme pin v instanci (konstruktor už proběhl)
   irToshiba = IRToshibaAC(irPin);
+
+  // Pro jistotu nastavíme pin jako výstup
+  pinMode(irPin, OUTPUT);
+  digitalWrite(irPin, LOW);
+
   irToshiba.begin();
 }
 
@@ -47,19 +52,90 @@ void IRControl_sendFromState() {
   Serial.print(F("[IR] gAcState.power = "));
   Serial.println(gAcState.power);
 
-  // Před generováním rámce pro jistotu srovnáme gAcState
-  // (rozsahy teplot, povolené hodnoty).
-  AcState_normalize();
+  // POZOR:
+  // AcState_normalize() se volá z vyšší vrstvy (onAcStateChanged),
+  // tady předpokládáme, že gAcState je už v rozumném stavu.
+
+  // ======================================================================
+  // VĚTEV 1: POWER = ON -> použijeme logiku z IRToshibaAC (knihovna).
+  // Tohle je přesně ten kód, se kterým fungovalo zapnutí.
+  // ======================================================================
+  if (gAcState.power == "on") {
+    irToshiba.stateReset();
+
+    // Power ON
+    irToshiba.setPower(true);
+
+    // Teplota
+    irToshiba.setTemp(gAcState.temp);
+
+    // Režim
+    stdAc::opmode_t op = IRControl_modeToStdAc(gAcState.mode);
+    uint8_t nativeMode = IRToshibaAC::convertMode(op);
+    irToshiba.setMode(nativeMode);
+
+    // Ventilátor
+    stdAc::fanspeed_t fs = IRControl_fanToStdAc(gAcState.fan);
+    uint8_t nativeFan = IRToshibaAC::convertFan(fs);
+    irToshiba.setFan(nativeFan);
+
+    // Swing
+    uint8_t nativeSwing = IRControl_swingToNative(gAcState.swing);
+    irToshiba.setSwing(nativeSwing);
+
+    // Filtr
+    bool filterOn = (gAcState.pure == "on");
+    irToshiba.setFilter(filterOn);
+
+    // Power select → Econo / Turbo / Normal
+    if (gAcState.powerSelect == "50%") {
+      irToshiba.setEcono(true);
+      irToshiba.setTurbo(false);
+    } else if (gAcState.powerSelect == "100%") {
+      irToshiba.setEcono(false);
+      irToshiba.setTurbo(true);
+    } else {
+      // typicky "75%" = normální režim
+      irToshiba.setEcono(false);
+      irToshiba.setTurbo(false);
+    }
+
+    // Debug stav
+    uint16_t stateLen = irToshiba.getStateLength();
+    uint8_t *state = irToshiba.getRaw();
+
+    Serial.print(F("[IR] Toshiba state length (bytes): "));
+    Serial.println(stateLen);
+    Serial.print(F("[IR] Raw state (ON):"));
+    for (uint16_t i = 0; i < stateLen; i++) {
+      Serial.print(' ');
+      if (state[i] < 0x10) Serial.print('0');
+      Serial.print(state[i], HEX);
+    }
+    Serial.println();
+
+    String dbg = irToshiba.toString();
+    Serial.print(F("[IR] IRToshibaAC state: "));
+    Serial.println(dbg);
+
+    // Skutečné vyslání IR – 2× opakování
+    irToshiba.send();
+    Serial.println(F("[IR] Sent via IRToshibaAC (POWER=ON, repeat=2)."));
+    return;
+  }
+
+  // ======================================================================
+  // VĚTEV 2: POWER = OFF -> použijeme náš ToshibaIrGenerator (funkční OFF).
+  // Tohle generuje přesný 72bit "OFF" rámec (MODE_OFF).
+  // ======================================================================
 
   hvacSettings hvac;
   AcState_toHvacSettings(hvac);
 
-  // Jednotný generátor pro ON i OFF:
-  // - power ON/OFF se vyhodnotí uvnitř ToshibaIrGeneratoru
-  //   z hvacSettings.state / operation.
+  // Vygeneruj 9-bajtový Toshiba rámec (F2 0D 03 FC 01 ...).
   ToshibaIR::Frame72 frame = ToshibaIR::buildFromHvacSettings(hvac);
 
-  Serial.print(F("[IR] Generated Toshiba 72-bit frame:"));
+  Serial.print(F("[IR] Generated frame72 (OFF):"));
   for (uint8_t i = 0; i < 9; i++) {
     Serial.print(' ');
     if (frame.data[i] < 0x10) Serial.print('0');
@@ -82,7 +158,7 @@ void IRControl_sendFromState() {
 
   Serial.print(F("[IR] Toshiba state length (bytes): "));
   Serial.println(stateLen);
-  Serial.print(F("[IR] Raw state to send:"));
+  Serial.print(F("[IR] Raw state (OFF):"));
   for (uint16_t i = 0; i < copyLen; i++) {
     Serial.print(' ');
     if (state[i] < 0x10) Serial.print('0');
@@ -90,7 +166,7 @@ void IRControl_sendFromState() {
   }
   Serial.println();
 
-  // Skutečné vyslání IR – interní opakování řeší knihovna.
+  // Pro OFF nám interní interpretace knihovny nemusí sedět, toString() neřešíme.
   irToshiba.send();
-  Serial.println(F("[IR] Sent Toshiba frame via IRToshibaAC (repeat=2)."));
+  Serial.println(F("[IR] Sent OFF via IRToshibaAC (POWER=OFF, repeat=2)."));
 }
